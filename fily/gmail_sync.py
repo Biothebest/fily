@@ -16,8 +16,7 @@ from collections.abc import Mapping
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-_DEFAULT_MAX_MESSAGES = 100
-_MAX_MESSAGES = 10_000
+_MAX_MESSAGES = 20_000
 
 
 _TAG_RE = re.compile(r"<[^>]*>")
@@ -179,17 +178,38 @@ def _metadata_for(message: Mapping[str, Any], message_id: str, client: Any) -> T
     return metadata, text, extraction_errors
 
 
-def sync_gmail(store: Any, client: Any, query: str = "", max_messages: int = 100) -> Dict[str, Any]:
+def sync_gmail(
+    store: Any,
+    client: Any,
+    query: str = "",
+    max_messages: int = 100,
+    page_token: Optional[str] = None,
+) -> Dict[str, Any]:
     """Fetch Gmail messages and upsert searchable, read-only local records.
 
-    The Gmail client is expected to perform only GET requests.  A failed fetch
-    or upsert is recorded in ``errors`` and does not prevent later messages from
-    being synchronized.
+    ``next_page_token`` is returned so a caller can resume a large mailbox
+    without starting over.  The Gmail client is expected to perform only GET
+    requests.  A failed fetch or upsert is recorded in ``errors`` and does not
+    prevent later messages from being synchronized.
     """
     limit = _bounded_max_messages(max_messages)
-    result: Dict[str, Any] = {"synced": [], "skipped": [], "errors": [], "next_page_token": None}
+    result: Dict[str, Any] = {
+        "synced": [],
+        "skipped": [],
+        "errors": [],
+        "next_page_token": None,
+    }
     try:
-        listing_response = client.list_messages(query=query or "", max_messages=limit)
+        try:
+            listing_response = client.list_messages(
+                query=query or "",
+                max_messages=limit,
+                page_token=page_token,
+            )
+        except TypeError:
+            if page_token is not None:
+                raise
+            listing_response = client.list_messages(query=query or "", max_messages=limit)
         listings, next_page_token = _message_listing(listing_response)
         result["next_page_token"] = next_page_token
     except Exception as exc:

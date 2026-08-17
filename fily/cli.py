@@ -318,6 +318,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--account", default=DEFAULT_GMAIL_ACCOUNT)
     p.add_argument("--query", default="", help="Gmail search query, e.g. from:fred invoice")
     p.add_argument("--max-messages", type=int, default=100)
+    p.add_argument("--page-token", help="resume from a prior JSON result's next_page_token")
     p.add_argument("--no-browser", action="store_true", help="do not open a browser during first authorization")
     p.add_argument("--json", action="store_true", dest="as_json")
 
@@ -352,7 +353,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             store = Store(root)
             client = GmailClient(args.client_secret, args.token_path, args.account)
             client.authorize(open_browser=not args.no_browser)
-            result = sync_gmail(store, client, query=args.query, max_messages=args.max_messages)
+            result = sync_gmail(
+                store,
+                client,
+                query=args.query,
+                max_messages=args.max_messages,
+                page_token=args.page_token,
+            )
             if args.as_json:
                 _print_json(result)
             else:

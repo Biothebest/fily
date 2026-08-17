@@ -117,7 +117,12 @@ class GmailClient:
         self._token = token
         return dict(token)
 
-    def list_messages(self, query: str = "", max_messages: int = 100) -> Dict[str, Any]:
+    def list_messages(
+        self,
+        query: str = "",
+        max_messages: int = 100,
+        page_token: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """List at most ``max_messages`` message references across Gmail pages.
 
         The returned mapping uses ``messages`` and ``next_page_token`` keys.
@@ -134,8 +139,9 @@ class GmailClient:
             return {"messages": [], "next_page_token": None}
 
         messages: List[Dict[str, Any]] = []
-        page_token: Optional[str] = None
-        seen_tokens = set()
+        if page_token is not None and (not isinstance(page_token, str) or not page_token):
+            raise ValueError("page_token must be a non-empty string when provided")
+        seen_tokens = {page_token} if page_token else set()
         while len(messages) < max_messages:
             remaining = max_messages - len(messages)
             params: Dict[str, str] = {"maxResults": str(min(500, remaining))}
