@@ -16,8 +16,11 @@ from typing import Any, Iterable, Optional, Sequence
 from .agent import FilyAgent
 from .ingest import ingest_path
 from .store import Store
+from .gmail import GmailClient
+from .gmail_sync import sync_gmail
 
 DEFAULT_LIBRARY = Path("~/FilyLibrary")
+DEFAULT_GMAIL_ACCOUNT = "matthew.benitez23@gmail.com"
 
 
 def _library(value: Optional[str]) -> Path:
@@ -302,6 +305,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--status")
     p.add_argument("--json", action="store_true", dest="as_json")
 
+    p = sub.add_parser("gmail-auth", help="authorize read-only access to Gmail")
+    p.add_argument("--client-secret", required=True, help="Google OAuth client JSON")
+    p.add_argument("--token-path", help="token file (default: ~/.fily/gmail-token.json)")
+    p.add_argument("--account", default=DEFAULT_GMAIL_ACCOUNT)
+    p.add_argument("--no-browser", action="store_true", help="print the consent URL instead of opening a browser")
+
+    p = sub.add_parser("gmail-sync", help="sync Gmail messages into the local read-only index")
+    p.add_argument("library", nargs="?", help="library directory (default: ~/FilyLibrary)")
+    p.add_argument("--client-secret", required=True, help="Google OAuth client JSON")
+    p.add_argument("--token-path", help="token file (default: ~/.fily/gmail-token.json)")
+    p.add_argument("--account", default=DEFAULT_GMAIL_ACCOUNT)
+    p.add_argument("--query", default="", help="Gmail search query, e.g. from:fred invoice")
+    p.add_argument("--max-messages", type=int, default=100)
+    p.add_argument("--no-browser", action="store_true", help="do not open a browser during first authorization")
+    p.add_argument("--json", action="store_true", dest="as_json")
+
     for name in ("approve", "reject", "execute"):
         p = sub.add_parser(name, help="{} an archive action".format(name))
         p.add_argument("items", nargs="+", metavar="ID")
@@ -313,6 +332,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         command = args.command
+        if command == "gmail-auth":
+            client = GmailClient(args.client_secret, args.token_path, args.account)
+            token = client.authorize(open_browser=not args.no_browser)
+            if isinstance(token, dict):
+                _print_json(
+                    {
+                        "account": args.account,
+                        "token_path": str(client.token_path),
+                        "scope": token.get("scope") or token.get("scopes"),
+                    }
+                )
+            else:
+                print("Gmail authorization complete for {}.".format(args.account))
+            return 0
+
+        if command == "gmail-sync":
+            root = _library(args.library)
+            store = Store(root)
+            client = GmailClient(args.client_secret, args.token_path, args.account)
+            client.authorize(open_browser=not args.no_browser)
+            result = sync_gmail(store, client, query=args.query, max_messages=args.max_messages)
+            if args.as_json:
+                _print_json(result)
+            else:
+                print(
+                    "Synced {} Gmail message(s); skipped {}; errors {}.".format(
+                        len(result.get("synced", [])),
+                        len(result.get("skipped", [])),
+                        len(result.get("errors", [])),
+                    )
+                )
+                for error in result.get("errors", []):
+                    print("error: {}".format(error), file=sys.stderr)
+            return 1 if result.get("errors") and not result.get("synced") else 0
+
         if command == "init":
             root = _library(args.library)
             root.mkdir(parents=True, exist_ok=True)

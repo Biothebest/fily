@@ -8,6 +8,7 @@ Store actions which a caller must explicitly approve and execute.
 from __future__ import annotations
 
 import re
+import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
@@ -159,9 +160,30 @@ class FilyAgent:
                 "documents": [],
                 "actions": [],
             }
-
-        documents = self._matching_documents(subject, limit)
+        matched_documents = self._matching_documents(subject, limit)
+        gmail_documents = []
+        documents = []
+        for document in matched_documents:
+            metadata = document.get("metadata_json", "{}")
+            try:
+                metadata = json.loads(metadata) if isinstance(metadata, str) else metadata
+            except (TypeError, ValueError):
+                metadata = {}
+            if isinstance(metadata, Mapping) and metadata.get("source") == "gmail":
+                gmail_documents.append(document)
+            else:
+                documents.append(document)
         if not documents:
+            if gmail_documents:
+                return {
+                    "intent": "archive",
+                    "answer": (
+                        "Found {} Gmail message{} for {!r}. The Gmail demo is read-only, "
+                        "so no Gmail action was proposed."
+                    ).format(len(gmail_documents), "" if len(gmail_documents) == 1 else "s", subject),
+                    "documents": gmail_documents,
+                    "actions": [],
+                }
             return {
                 "intent": "archive",
                 "answer": "No documents matched {!r}; no action was proposed.".format(subject),
@@ -271,7 +293,7 @@ class FilyAgent:
         for candidate in candidates:
             item = self._document_dict(candidate)
             haystack = self._normalize(
-                " ".join(str(item.get(field, "")) for field in ("name", "path", "text"))
+                " ".join(str(item.get(field, "")) for field in ("name", "path", "text", "metadata_json"))
             )
             if tokens and all(token in haystack for token in tokens):
                 key = item.get("id") or item.get("path") or item.get("name")
@@ -299,7 +321,7 @@ class FilyAgent:
             haystack = self._normalize(
                 " ".join(
                     str(document.get(field, ""))
-                    for field in ("name", "path", "text")
+                    for field in ("name", "path", "text", "metadata_json")
                 )
             )
             if all(token in haystack for token in tokens):
