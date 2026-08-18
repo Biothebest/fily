@@ -6,7 +6,10 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "desktop:sidecar": "python3 ../desktop/build_sidecar.py",
+    "desktop:dev": "pnpm desktop:sidecar && tauri dev",
+    "desktop:build": "pnpm desktop:sidecar && tauri build"
   },
   "dependencies": {
     "@base-ui/react": "^1.5.0",
@@ -22,6 +25,7 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.3.3",
+    "@tauri-apps/cli": "^2.11.4",
     "@types/node": "^24",
     "@types/react": "^19",
     "@types/react-dom": "^19",
