@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-create-send-preview"
+description = "Enables the create_send_preview command without any pre-configured scope."
+commands.allow = ["create_send_preview"]
+
+[[permission]]
+identifier = "deny-create-send-preview"
+description = "Denies the create_send_preview command without any pre-configured scope."
+commands.deny = ["create_send_preview"]

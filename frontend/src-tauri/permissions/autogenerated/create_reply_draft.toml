@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-create-reply-draft"
+description = "Enables the create_reply_draft command without any pre-configured scope."
+commands.allow = ["create_reply_draft"]
+
+[[permission]]
+identifier = "deny-create-reply-draft"
+description = "Denies the create_reply_draft command without any pre-configured scope."
+commands.deny = ["create_reply_draft"]

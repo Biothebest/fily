@@ -4,16 +4,20 @@ pub mod icloud;
 pub mod imap;
 pub mod yahoo;
 
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::mail::{
-    ConnectRequest, ConnectedAccount, DisconnectRequest, DraftRequest, DraftResult, Folder,
-    ListFoldersRequest, Message, MoveRequest, MutationRequest, MutationResult, ProviderKind,
-    RetrieveRequest, SearchRequest, SearchResults, SendRequest, SendResult, SyncBatch, SyncRequest,
-    Validate, ValidationError,
+    ConnectRequest, ConnectedAccount, DeleteDraftRequest, DisconnectRequest, DraftRequest,
+    DraftResult, Folder, ListFoldersRequest, Message, MoveRequest, MutationRequest, MutationResult,
+    ProviderKind, RetrieveRequest, SearchRequest, SearchResults, SendRequest, SendResult, SyncBatch,
+    SyncRequest, Validate, ValidationError,
 };
 use crate::vault::CredentialVault;
 
@@ -84,6 +88,7 @@ pub trait MailProvider: Send + Sync {
     async fn retrieve(&self, request: RetrieveRequest) -> ProviderResult<Message>;
     async fn search(&self, request: SearchRequest) -> ProviderResult<SearchResults>;
     async fn draft(&self, request: DraftRequest) -> ProviderResult<DraftResult>;
+    async fn delete_draft(&self, request: DeleteDraftRequest) -> ProviderResult<()>;
     async fn send(&self, request: SendRequest) -> ProviderResult<SendResult>;
     async fn move_messages(&self, request: MoveRequest) -> ProviderResult<MutationResult>;
     async fn archive(&self, request: MutationRequest) -> ProviderResult<MutationResult>;
@@ -95,6 +100,7 @@ pub trait MailProvider: Send + Sync {
 /// presentation code, preventing a provider from being silently replaced after startup.
 pub struct ProviderRegistry {
     providers: BTreeMap<ProviderKind, Arc<dyn MailProvider>>,
+    send_authorizations: Mutex<BTreeMap<String, (ProviderKind, String, String)>>,
 }
 
 impl ProviderRegistry {
@@ -117,7 +123,10 @@ impl ProviderRegistry {
             }
             providers.insert(kind, provider);
         }
-        Ok(Self { providers })
+        Ok(Self {
+            providers,
+            send_authorizations: Mutex::new(BTreeMap::new()),
+        })
     }
 
     fn get(&self, kind: ProviderKind) -> ProviderResult<&Arc<dyn MailProvider>> {
@@ -190,12 +199,58 @@ impl ProviderRegistry {
         self.get(kind)?.draft(request).await
     }
 
+    pub async fn delete_draft(
+        &self,
+        kind: ProviderKind,
+        request: DeleteDraftRequest,
+    ) -> ProviderResult<()> {
+        request.validate()?;
+        self.get(kind)?.delete_draft(request).await
+    }
+
+    pub(crate) fn issue_send_authorization(
+        &self,
+        kind: ProviderKind,
+        request: &SendRequest,
+    ) -> ProviderResult<()> {
+        request.validate()?;
+        let mut authorizations = self
+            .send_authorizations
+            .lock()
+            .map_err(|_| ProviderError::ProviderFailure)?;
+        if authorizations.contains_key(request.authorization_id.as_str()) {
+            return Err(ProviderError::Conflict);
+        }
+        authorizations.insert(
+            request.authorization_id.as_str().to_owned(),
+            (
+                kind,
+                request.account_id.as_str().to_owned(),
+                request.draft_id.as_str().to_owned(),
+            ),
+        );
+        Ok(())
+    }
+
     pub async fn send(
         &self,
         kind: ProviderKind,
         request: SendRequest,
     ) -> ProviderResult<SendResult> {
         request.validate()?;
+        let expected = self
+            .send_authorizations
+            .lock()
+            .map_err(|_| ProviderError::ProviderFailure)?
+            .remove(request.authorization_id.as_str());
+        let actual = (
+            kind,
+            request.account_id.as_str().to_owned(),
+            request.draft_id.as_str().to_owned(),
+        );
+        if expected.as_ref() != Some(&actual) {
+            return Err(ProviderError::Unauthorized);
+        }
         self.get(kind)?.send(request).await
     }
 
@@ -268,6 +323,9 @@ struct CommandBoundaryAuthorization;
 
 impl gmail::GmailAuthorizationGate for CommandBoundaryAuthorization {
     fn authorize_draft(&self, _request: &DraftRequest) -> bool {
+        true
+    }
+    fn authorize_delete_draft(&self, _request: &DeleteDraftRequest) -> bool {
         true
     }
     fn authorize_send(&self, _request: &SendRequest) -> bool {

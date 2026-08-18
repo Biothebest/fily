@@ -19,10 +19,11 @@ use crate::{
         PlanApproval, PlanPreview, PlanRequest, PlanState, PreviewChange, ResourceVersion,
     },
     domain::mail::{
-        AccountId, ConnectRequest, ConnectedAccount, CredentialId, DisconnectRequest, DraftRequest,
-        DraftResult, EmailAddress, FolderId, ListFoldersRequest, Message as ProviderMessage,
-        MessageId, MoveRequest, OperationId, ProviderEndpoint, ProviderKind, RetrieveRequest,
-        SyncChange, SyncRequest, Validate,
+        AccountId, AttachmentId, ConnectRequest, ConnectedAccount, CredentialId,
+        DeleteDraftRequest, DisconnectRequest, DraftId, DraftRequest, EmailAddress, FolderId,
+        ListFoldersRequest, Message as ProviderMessage, MessageId, MoveRequest, OperationId,
+        ProviderEndpoint, ProviderKind, RetrieveRequest, SendRequest, SendResult, SyncChange,
+        SyncRequest, Validate,
     },
     migration::{self, LegacyMigrationState, LegacyMigrationStatus, MigrationError},
     native_credentials::{
@@ -31,9 +32,10 @@ use crate::{
     providers::{gmail_oauth::GmailOAuthOnboarding, ProviderError, ProviderRegistry},
     recovery::{RecoveryRecord as AuthorizedRecovery, RecoveryStore},
     storage::{
-        AccountRecord, AuditRecord, FolderRecord, MessageBody, MessageRecord, PlanRecord,
-        RecoveryRecord as StoredRecovery, Storage, StorageError, SyncCursorRecord,
+        AccountRecord, AuditRecord, DraftRecord, FolderRecord, MessageBody, MessageRecord,
+        PlanRecord, RecoveryRecord as StoredRecovery, Storage, StorageError, SyncCursorRecord,
     },
+    sync as mailbox_sync,
     vault::CredentialVault,
 };
 
@@ -322,6 +324,7 @@ pub struct SanitizedMessage {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MessageRequest {
+    pub account_id: String,
     pub message_id: String,
 }
 
@@ -344,7 +347,15 @@ pub struct SearchHitView {
 pub struct ListMessagesRequest {
     pub account_id: String,
     pub folder_id: Option<String>,
+    pub cursor: Option<String>,
     pub limit: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagePage {
+    pub messages: Vec<MessageSummaryView>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -487,12 +498,92 @@ pub struct AuditPage {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DraftMutationRequest {
+    pub account_id: String,
+    pub draft_id: Option<String>,
+    pub to: Vec<EmailAddress>,
+    pub cc: Vec<EmailAddress>,
+    pub bcc: Vec<EmailAddress>,
+    pub subject: String,
+    pub text_body: Option<String>,
+    pub html_body: Option<String>,
+    pub attachment_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ListDraftsRequest {
+    pub account_id: String,
+    pub cursor: Option<String>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DraftIdRequest {
+    pub account_id: String,
+    pub draft_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReplyDraftRequest {
+    pub account_id: String,
+    pub message_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftView {
+    pub id: String,
+    pub account_id: String,
+    pub in_reply_to: Option<String>,
+    pub to: Vec<EmailAddress>,
+    pub cc: Vec<EmailAddress>,
+    pub bcc: Vec<EmailAddress>,
+    pub subject: String,
+    pub text_body: Option<String>,
+    pub html_body: Option<String>,
+    pub attachment_ids: Vec<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftPage {
+    pub drafts: Vec<DraftView>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteDraftResult {
+    pub deleted: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendExecution {
+    pub plan_id: String,
+    pub status: &'static str,
+    pub message_id: String,
+    pub sent_at: String,
+    pub summary: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PlannedOperation {
     Disconnect {
         account_id: String,
         provider: ProviderKind,
+    },
+    Send {
+        account_id: String,
+        provider: ProviderKind,
+        draft_id: String,
     },
 }
 
@@ -852,7 +943,7 @@ async fn persist_connected_account(
         created_at: now,
         updated_at: now,
     })?;
-    let folders = state
+    let provider_folders = state
         .providers
         .list_folders(
             connected.provider,
@@ -861,19 +952,16 @@ async fn persist_connected_account(
             },
         )
         .await?;
-    for folder in folders {
-        state.storage.upsert_folder(&FolderRecord {
-            id: folder.id.as_str().to_owned(),
-            account_id: connected.account_id.as_str().to_owned(),
-            remote_id: folder.id.as_str().to_owned(),
-            parent_id: None,
-            name: folder.name,
-            role: Some(format!("{:?}", folder.role).to_ascii_lowercase()),
-            unread_count: folder.unread_count.unwrap_or(0).min(u32::MAX as u64) as u32,
-            total_count: folder.total_count.unwrap_or(0).min(u32::MAX as u64) as u32,
-            updated_at: now,
-        })?;
-    }
+    let existing = state.storage.list_folders(connected.account_id.as_str())?;
+    let folders = mailbox_sync::folder_records(
+        connected.account_id.as_str(),
+        provider_folders,
+        &existing,
+        now,
+    );
+    state
+        .storage
+        .reconcile_folders(connected.account_id.as_str(), &folders)?;
     Ok(())
 }
 
@@ -927,23 +1015,39 @@ pub fn list_folders(
 pub fn list_messages(
     state: State<'_, AppState>,
     request: ListMessagesRequest,
-) -> Result<Vec<MessageSummaryView>, CommandError> {
+) -> Result<MessagePage, CommandError> {
     validate_id(&request.account_id)?;
-    if let Some(folder) = &request.folder_id {
-        validate_id(folder)?;
+    if let Some(folder_id) = &request.folder_id {
+        validate_id(folder_id)?;
+        let folder = state
+            .storage
+            .get_folder(folder_id)?
+            .ok_or_else(CommandError::not_found)?;
+        if folder.account_id != request.account_id {
+            return Err(CommandError::not_found());
+        }
+    }
+    if let Some(cursor) = &request.cursor {
+        validate_id(cursor)?;
     }
     validate_limit(request.limit)?;
     state.account(&request.account_id)?;
-    Ok(state
-        .storage
-        .list_messages(
-            &request.account_id,
-            request.folder_id.as_deref(),
-            request.limit,
-        )?
-        .into_iter()
-        .map(message_summary)
-        .collect())
+    let mut records = state.storage.list_messages_page(
+        &request.account_id,
+        request.folder_id.as_deref(),
+        request.cursor.as_deref(),
+        request.limit + 1,
+    )?;
+    let next_cursor = if records.len() > request.limit as usize {
+        records.truncate(request.limit as usize);
+        records.last().map(|message| message.id.clone())
+    } else {
+        None
+    };
+    Ok(MessagePage {
+        messages: records.into_iter().map(message_summary).collect(),
+        next_cursor,
+    })
 }
 
 #[tauri::command]
@@ -951,11 +1055,16 @@ pub async fn get_message(
     state: State<'_, AppState>,
     request: MessageRequest,
 ) -> Result<SanitizedMessage, CommandError> {
+    validate_id(&request.account_id)?;
     validate_id(&request.message_id)?;
+    state.account(&request.account_id)?;
     let stored = state
         .storage
         .get_message(&request.message_id)?
         .ok_or_else(CommandError::not_found)?;
+    if stored.account_id != request.account_id {
+        return Err(CommandError::not_found());
+    }
     if stored.body.text.is_some() {
         return stored_message_view(&state.storage, stored);
     }
@@ -1009,24 +1118,517 @@ pub fn search_messages(
 #[tauri::command]
 pub async fn create_draft(
     state: State<'_, AppState>,
-    request: DraftRequest,
-) -> Result<DraftResult, CommandError> {
-    request.validate().map_err(|_| CommandError::invalid())?;
-    let account = state.account(request.account_id.as_str())?;
-    let result = state
+    request: DraftMutationRequest,
+) -> Result<DraftView, CommandError> {
+    if request.draft_id.is_some() {
+        return Err(CommandError::invalid());
+    }
+    save_draft(&state, request, None, None, None, "draft_created").await
+}
+
+#[tauri::command]
+pub async fn update_draft(
+    state: State<'_, AppState>,
+    request: DraftMutationRequest,
+) -> Result<DraftView, CommandError> {
+    let draft_id = request.draft_id.clone().ok_or_else(CommandError::invalid)?;
+    let (record, existing) = owned_draft(&state.storage, &request.account_id, &draft_id)?;
+    save_draft(
+        &state,
+        request,
+        Some(record.remote_id),
+        Some(record.id),
+        existing.in_reply_to.map(|id| id.into_inner()),
+        "draft_updated",
+    )
+    .await
+}
+
+#[tauri::command]
+pub fn list_drafts(
+    state: State<'_, AppState>,
+    request: ListDraftsRequest,
+) -> Result<DraftPage, CommandError> {
+    validate_id(&request.account_id)?;
+    if let Some(cursor) = &request.cursor {
+        validate_id(cursor)?;
+    }
+    validate_limit(request.limit)?;
+    state.account(&request.account_id)?;
+    let mut records = state.storage.list_drafts(
+        &request.account_id,
+        request.cursor.as_deref(),
+        request.limit + 1,
+    )?;
+    let next_cursor = if records.len() > request.limit as usize {
+        records.truncate(request.limit as usize);
+        records.last().map(|draft| draft.id.clone())
+    } else {
+        None
+    };
+    let drafts = records
+        .into_iter()
+        .map(draft_view)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(DraftPage {
+        drafts,
+        next_cursor,
+    })
+}
+
+#[tauri::command]
+pub async fn delete_draft(
+    state: State<'_, AppState>,
+    request: DraftIdRequest,
+) -> Result<DeleteDraftResult, CommandError> {
+    let (record, _) = owned_draft(&state.storage, &request.account_id, &request.draft_id)?;
+    let account = state.account(&request.account_id)?;
+    state
         .providers
-        .draft(state.provider_for(&account)?, request)
+        .delete_draft(
+            state.provider_for(&account)?,
+            DeleteDraftRequest {
+                account_id: AccountId::new(account.id.clone())
+                    .map_err(|_| CommandError::invalid())?,
+                draft_id: DraftId::new(record.remote_id).map_err(|_| CommandError::invalid())?,
+            },
+        )
         .await?;
+    let deleted = state.storage.delete_draft(&record.id)?;
     append_audit(
         &state.storage,
         None,
         Some(&account.id),
-        "draft_created",
+        "draft_deleted",
         "allowed",
-        "A draft was created.",
+        "A draft was deleted.",
         now_ms()?,
     )?;
-    Ok(result)
+    Ok(DeleteDraftResult { deleted })
+}
+
+#[tauri::command]
+pub async fn create_reply_draft(
+    state: State<'_, AppState>,
+    request: ReplyDraftRequest,
+) -> Result<DraftView, CommandError> {
+    validate_id(&request.account_id)?;
+    validate_id(&request.message_id)?;
+    let stored = state
+        .storage
+        .get_message(&request.message_id)?
+        .ok_or_else(CommandError::not_found)?;
+    if stored.account_id != request.account_id {
+        return Err(CommandError::not_found());
+    }
+    let account = state.account(&request.account_id)?;
+    let message = state
+        .providers
+        .retrieve(
+            state.provider_for(&account)?,
+            RetrieveRequest {
+                account_id: AccountId::new(account.id.clone())
+                    .map_err(|_| CommandError::invalid())?,
+                message_id: MessageId::new(stored.remote_id.clone())
+                    .map_err(|_| CommandError::invalid())?,
+                include_body: false,
+                max_attachment_bytes: 0,
+            },
+        )
+        .await?;
+    let recipient = message
+        .reply_to
+        .or(message.summary.from)
+        .ok_or_else(CommandError::invalid)?;
+    let subject = if message
+        .summary
+        .subject
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("re:")
+    {
+        message.summary.subject
+    } else {
+        format!("Re: {}", message.summary.subject)
+    };
+    save_draft(
+        &state,
+        DraftMutationRequest {
+            account_id: request.account_id,
+            draft_id: None,
+            to: vec![recipient],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject,
+            text_body: Some(String::new()),
+            html_body: None,
+            attachment_ids: Vec::new(),
+        },
+        None,
+        None,
+        Some(stored.remote_id),
+        "reply_draft_created",
+    )
+    .await
+}
+
+#[tauri::command]
+pub fn create_send_preview(
+    state: State<'_, AppState>,
+    request: DraftIdRequest,
+) -> Result<AgentPlanView, CommandError> {
+    let (record, draft) = owned_draft(&state.storage, &request.account_id, &request.draft_id)?;
+    let account = state.account(&request.account_id)?;
+    let provider = state.provider_for(&account)?;
+    let now = now_ms()?;
+    let recipient_count = draft.to.len() + draft.cc.len() + draft.bcc.len();
+    if recipient_count == 0 {
+        return Err(CommandError::invalid());
+    }
+    let recipients = draft
+        .to
+        .iter()
+        .chain(&draft.cc)
+        .chain(&draft.bcc)
+        .map(|address| address.address.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let plan = state.policy()?.create_plan(
+        PlanRequest {
+            account_id: account.id.clone(),
+            action: PlanAction::Send,
+            affected: vec![ResourceVersion {
+                resource_id: record.id.clone(),
+                version: draft_version(&record)?,
+            }],
+            reason: "Send the immutable reviewed draft from the selected connected account.".into(),
+            preview: PlanPreview {
+                summary: format!(
+                    "Send “{}” to {} recipient{}",
+                    bounded_output(&draft.subject, 240),
+                    recipient_count,
+                    if recipient_count == 1 { "" } else { "s" }
+                ),
+                affected_count: 1,
+                changes: vec![
+                    PreviewChange {
+                        resource_id: record.id.clone(),
+                        description: format!("From: {}", bounded_output(&account.address, 320)),
+                    },
+                    PreviewChange {
+                        resource_id: record.id.clone(),
+                        description: format!("To: {}", bounded_output(&recipients, 1_000)),
+                    },
+                    PreviewChange {
+                        resource_id: record.id.clone(),
+                        description: format!("Subject: {}", bounded_output(&draft.subject, 998)),
+                    },
+                ],
+            },
+            expires_in_ms: PLAN_TTL_MS,
+        },
+        now,
+    )?;
+    persist_plan(
+        &state.storage,
+        &StoredPlanPayload {
+            plan: plan.clone(),
+            operation: PlannedOperation::Send {
+                account_id: account.id.clone(),
+                provider,
+                draft_id: record.id,
+            },
+        },
+    )?;
+    append_audit(
+        &state.storage,
+        Some(&plan.plan_id),
+        Some(&account.id),
+        "send_preview_created",
+        "allowed",
+        "A send preview was created.",
+        now,
+    )?;
+    Ok(plan_view(&plan))
+}
+
+#[tauri::command]
+pub async fn execute_send(
+    state: State<'_, AppState>,
+    request: PlanIdRequest,
+) -> Result<SendExecution, CommandError> {
+    validate_id(&request.plan_id)?;
+    let stored_plan = load_plan(&state.storage, &request.plan_id)?;
+    let (account_id, provider, draft_id) = match &stored_plan.operation {
+        PlannedOperation::Send {
+            account_id,
+            provider,
+            draft_id,
+        } => (account_id.clone(), *provider, draft_id.clone()),
+        PlannedOperation::Disconnect { .. } => return Err(CommandError::invalid()),
+    };
+    let (draft_record, draft) = owned_draft(&state.storage, &account_id, &draft_id)?;
+    let account = state.account(&account_id)?;
+    if state.provider_for(&account)? != provider {
+        return Err(CommandError::denied());
+    }
+    let now = now_ms()?;
+    let authorization = state.policy()?.authorize_execution(
+        ExecutionRequest {
+            plan_id: stored_plan.plan.plan_id.clone(),
+            integrity_hash: stored_plan.plan.integrity_hash.clone(),
+            current_versions: vec![ResourceVersion {
+                resource_id: draft_record.id.clone(),
+                version: draft_version(&draft_record)?,
+            }],
+        },
+        now,
+    )?;
+    persist_plan(
+        &state.storage,
+        &StoredPlanPayload {
+            plan: authorization.plan.clone(),
+            operation: stored_plan.operation,
+        },
+    )?;
+    append_audit(
+        &state.storage,
+        Some(&authorization.plan.plan_id),
+        Some(&account.id),
+        "send_authorized",
+        "allowed",
+        "A single-use send authorization was consumed.",
+        now,
+    )?;
+    let send_request = SendRequest {
+        account_id: AccountId::new(account.id.clone()).map_err(|_| CommandError::invalid())?,
+        draft_id: DraftId::new(draft_record.remote_id.clone())
+            .map_err(|_| CommandError::invalid())?,
+        authorization_id: OperationId::new(authorization.plan.plan_id.clone())
+            .map_err(|_| CommandError::invalid())?,
+    };
+    state
+        .providers
+        .issue_send_authorization(provider, &send_request)?;
+    let send = state.providers.send(provider, send_request).await;
+    let result = match send {
+        Ok(result) => result,
+        Err(error) => {
+            append_audit(
+                &state.storage,
+                Some(&authorization.plan.plan_id),
+                Some(&account.id),
+                "send_executed",
+                "failed",
+                "The confirmed send failed.",
+                now,
+            )?;
+            return Err(error.into());
+        }
+    };
+    let sent_message_id =
+        persist_sent_message(&state.storage, &account, &draft_record, &draft, &result)?;
+    state.storage.delete_draft(&draft_record.id)?;
+    append_audit(
+        &state.storage,
+        Some(&authorization.plan.plan_id),
+        Some(&account.id),
+        "send_executed",
+        "allowed",
+        "The confirmed draft was sent.",
+        result.sent_at_ms.max(0) as u64,
+    )?;
+    Ok(SendExecution {
+        plan_id: authorization.plan.plan_id,
+        status: "executed",
+        message_id: sent_message_id,
+        sent_at: timestamp(result.sent_at_ms),
+        summary: "The confirmed draft was sent.".into(),
+    })
+}
+
+async fn save_draft(
+    state: &AppState,
+    request: DraftMutationRequest,
+    provider_draft_id: Option<String>,
+    previous_local_id: Option<String>,
+    in_reply_to: Option<String>,
+    audit_event: &str,
+) -> Result<DraftView, CommandError> {
+    let account = state.account(&request.account_id)?;
+    let account_id = AccountId::new(account.id.clone()).map_err(|_| CommandError::invalid())?;
+    let attachment_ids = request
+        .attachment_ids
+        .iter()
+        .cloned()
+        .map(AttachmentId::new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| CommandError::invalid())?;
+    let mut provider_request = DraftRequest {
+        account_id,
+        draft_id: provider_draft_id
+            .as_ref()
+            .map(|id| DraftId::new(id.clone()))
+            .transpose()
+            .map_err(|_| CommandError::invalid())?,
+        in_reply_to: in_reply_to
+            .map(MessageId::new)
+            .transpose()
+            .map_err(|_| CommandError::invalid())?,
+        to: request.to,
+        cc: request.cc,
+        bcc: request.bcc,
+        subject: request.subject,
+        text_body: request.text_body,
+        html_body: request.html_body,
+        attachment_ids,
+    };
+    provider_request
+        .validate()
+        .map_err(|_| CommandError::invalid())?;
+    let result = state
+        .providers
+        .draft(state.provider_for(&account)?, provider_request.clone())
+        .await?;
+    let result_id = result.draft_id.into_inner();
+    provider_request.draft_id =
+        Some(DraftId::new(result_id.clone()).map_err(|_| CommandError::invalid())?);
+    let local_seed = format!("{}\0{}", account.id, result_id);
+    let record = DraftRecord {
+        id: format!("draft:{}", crate::agent::sha256_hex(local_seed.as_bytes())),
+        account_id: account.id.clone(),
+        remote_id: result_id,
+        payload: serde_json::to_value(&provider_request)
+            .map_err(|_| CommandError::unavailable())?,
+        updated_at: result.updated_at_ms,
+    };
+    state.storage.upsert_draft(&record)?;
+    if let Some(previous) = previous_local_id.filter(|id| id != &record.id) {
+        state.storage.delete_draft(&previous)?;
+    }
+    append_audit(
+        &state.storage,
+        None,
+        Some(&account.id),
+        audit_event,
+        "allowed",
+        "A draft was saved.",
+        now_ms()?,
+    )?;
+    draft_view(record)
+}
+
+fn owned_draft(
+    storage: &Storage,
+    account_id: &str,
+    draft_id: &str,
+) -> Result<(DraftRecord, DraftRequest), CommandError> {
+    validate_id(account_id)?;
+    validate_id(draft_id)?;
+    let record = storage
+        .get_draft(draft_id)?
+        .ok_or_else(CommandError::not_found)?;
+    if record.account_id != account_id {
+        return Err(CommandError::not_found());
+    }
+    let draft: DraftRequest =
+        serde_json::from_value(record.payload.clone()).map_err(|_| CommandError::unavailable())?;
+    draft.validate().map_err(|_| CommandError::unavailable())?;
+    if draft.account_id.as_str() != account_id
+        || draft.draft_id.as_ref().map(DraftId::as_str) != Some(record.remote_id.as_str())
+    {
+        return Err(CommandError::denied());
+    }
+    Ok((record, draft))
+}
+fn draft_version(record: &DraftRecord) -> Result<String, CommandError> {
+    let encoded = serde_json::to_vec(&(
+        &record.id,
+        &record.account_id,
+        &record.remote_id,
+        &record.payload,
+        record.updated_at,
+    ))
+    .map_err(|_| CommandError::unavailable())?;
+    Ok(crate::agent::sha256_hex(&encoded))
+}
+
+fn draft_view(record: DraftRecord) -> Result<DraftView, CommandError> {
+    let draft: DraftRequest =
+        serde_json::from_value(record.payload).map_err(|_| CommandError::unavailable())?;
+    Ok(DraftView {
+        id: record.id,
+        account_id: record.account_id,
+        in_reply_to: draft.in_reply_to.map(|id| id.into_inner()),
+        to: draft.to,
+        cc: draft.cc,
+        bcc: draft.bcc,
+        subject: draft.subject,
+        text_body: draft.text_body,
+        html_body: draft.html_body,
+        attachment_ids: draft
+            .attachment_ids
+            .into_iter()
+            .map(|id| id.into_inner())
+            .collect(),
+        updated_at: timestamp(record.updated_at),
+    })
+}
+
+fn persist_sent_message(
+    storage: &Storage,
+    account: &AccountRecord,
+    draft_record: &DraftRecord,
+    draft: &DraftRequest,
+    result: &SendResult,
+) -> Result<String, CommandError> {
+    if account.id != draft_record.account_id {
+        return Err(CommandError::denied());
+    }
+    let remote_id = result.message_id.as_str().to_owned();
+    let local_id = crate::sync::local_message_id(&account.id, &remote_id);
+    let sent_folder = storage
+        .list_folders(&account.id)?
+        .into_iter()
+        .find(|folder| folder.role.as_deref() == Some("sent"));
+    let recipients = draft
+        .to
+        .iter()
+        .chain(&draft.cc)
+        .chain(&draft.bcc)
+        .map(|address| address.address.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let text = draft.text_body.clone();
+    let html = draft.html_body.clone();
+    let snippet_source = text.as_deref().unwrap_or_default();
+    let record = MessageRecord {
+        id: local_id,
+        account_id: account.id.clone(),
+        folder_id: sent_folder.as_ref().map(|folder| folder.id.clone()),
+        remote_id,
+        thread_id: None,
+        subject: draft.subject.clone(),
+        sender: account.address.clone(),
+        recipients,
+        snippet: bounded_output(snippet_source, 2_000),
+        flags: if draft.attachment_ids.is_empty() {
+            "sent".into()
+        } else {
+            "sent,attachment".into()
+        },
+        sent_at: Some(result.sent_at_ms),
+        received_at: result.sent_at_ms,
+        size_bytes: text.as_ref().map_or(0, |body| body.len()) as u64
+            + html.as_ref().map_or(0, |body| body.len()) as u64,
+        body: MessageBody { text, html },
+        updated_at: result.sent_at_ms,
+    };
+    let folder_ids = sent_folder
+        .map(|folder| vec![folder.id])
+        .unwrap_or_default();
+    let effective_id = storage.upsert_synced_message(&record, &folder_ids)?;
+    Ok(effective_id)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1048,6 +1650,9 @@ pub async fn start_sync(
 ) -> Result<SyncOutcome, CommandError> {
     validate_id(&request.account_id)?;
     let account = state.account(&request.account_id)?;
+    let provider = state.provider_for(&account)?;
+    let provider_account =
+        AccountId::new(account.id.clone()).map_err(|_| CommandError::unavailable())?;
     emit_sync_progress(
         &app,
         SyncOutcome {
@@ -1059,19 +1664,61 @@ pub async fn start_sync(
             status_message: Some("Starting secure provider sync."),
         },
     );
-    let cursor = state
+
+    let now = now_ms()? as i64;
+    let provider_folders = match state
+        .providers
+        .list_folders(
+            provider,
+            ListFoldersRequest {
+                account_id: provider_account.clone(),
+            },
+        )
+        .await
+    {
+        Ok(folders) => folders,
+        Err(error) => {
+            emit_sync_failure(&app, &account.id);
+            return Err(error.into());
+        }
+    };
+    let existing_folders = state.storage.list_folders(&account.id)?;
+    let folders =
+        mailbox_sync::folder_records(&account.id, provider_folders, &existing_folders, now);
+    state.storage.reconcile_folders(&account.id, &folders)?;
+
+    let mut cursor = state
         .storage
         .get_sync_cursor(&account.id, "account")?
         .map(|record| record.cursor);
-    let folder_ids = state
+    let mut snapshot_active = state
         .storage
-        .list_folders(&account.id)?
-        .into_iter()
-        .map(|folder| FolderId::new(folder.id).map_err(|_| CommandError::unavailable()))
-        .collect::<Result<Vec<_>, _>>()?;
+        .get_sync_cursor(&account.id, "account-snapshot")?
+        .is_some();
+    let cache_is_unpopulated = state
+        .storage
+        .list_messages(&account.id, None, 1)?
+        .is_empty();
+    let provider_has_mail = folders.iter().any(|folder| folder.total_count > 0);
+    if provider == ProviderKind::Gmail
+        && cursor.is_some()
+        && !snapshot_active
+        && cache_is_unpopulated
+        && provider_has_mail
+    {
+        state.storage.delete_sync_cursor(&account.id, "account")?;
+        cursor = None;
+    }
+    if cursor.is_none() && !snapshot_active {
+        state.storage.begin_sync_snapshot(&account.id, now)?;
+        snapshot_active = true;
+    }
+
+    // Gmail combines multiple labelIds with AND semantics. Every provider treats an empty filter
+    // as account-wide bounded traversal, and returned memberships are persisted independently.
     let sync_request = SyncRequest {
-        account_id: AccountId::new(account.id.clone()).map_err(|_| CommandError::unavailable())?,
-        folder_ids,
+        account_id: provider_account,
+        folder_ids: Vec::new(),
         cursor,
         limit: MAX_PAGE_SIZE as u16,
     };
@@ -1080,71 +1727,35 @@ pub async fn start_sync(
         .map_err(|_| CommandError::invalid())?;
     let batch = match state
         .providers
-        .incremental_sync(state.provider_for(&account)?, sync_request)
+        .incremental_sync(provider, sync_request)
         .await
     {
         Ok(batch) => batch,
         Err(error) => {
-            emit_sync_progress(
-                &app,
-                SyncOutcome {
-                    account_id: account.id.clone(),
-                    phase: "failed",
-                    processed: 0,
-                    total: None,
-                    has_more: false,
-                    status_message: Some("The provider sync could not be completed."),
-                },
-            );
+            emit_sync_failure(&app, &account.id);
             return Err(error.into());
         }
     };
-    let now = now_ms()? as i64;
+
+    let has_more = batch.has_more;
     let total = u32::try_from(batch.changes.len()).unwrap_or(MAX_PAGE_SIZE);
     let mut changed = 0_u32;
     for change in batch.changes {
         match change {
             SyncChange::Delete(message_id) => {
-                state.storage.delete_message(message_id.as_str())?;
+                state
+                    .storage
+                    .delete_message_by_remote_id(&account.id, message_id.as_str())?;
             }
             SyncChange::Upsert(message) => {
-                let sender = message
-                    .from
-                    .as_ref()
-                    .map(|address| address.address.clone())
-                    .unwrap_or_default();
-                let recipients = message
-                    .to
-                    .iter()
-                    .map(|address| address.address.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let flags = match (message.unread, message.has_attachments) {
-                    (true, true) => "unread,attachment",
-                    (true, false) => "unread",
-                    (false, true) => "attachment",
-                    (false, false) => "",
-                };
-                state.storage.upsert_message(&MessageRecord {
-                    id: message.id.as_str().to_owned(),
-                    account_id: account.id.clone(),
-                    folder_id: message.folder_ids.first().map(|id| id.as_str().to_owned()),
-                    remote_id: message.id.as_str().to_owned(),
-                    thread_id: message.thread_id,
-                    subject: message.subject,
-                    sender,
-                    recipients,
-                    snippet: message.preview,
-                    flags: flags.into(),
-                    sent_at: None,
-                    received_at: message.received_at_ms,
-                    size_bytes: 0,
-                    body: MessageBody {
-                        text: None,
-                        html: None,
-                    },
-                    updated_at: now,
-                })?;
+                let (record, folder_ids) =
+                    mailbox_sync::message_record(&account.id, message, &folders, now);
+                let persisted_id = state.storage.upsert_synced_message(&record, &folder_ids)?;
+                if snapshot_active {
+                    state
+                        .storage
+                        .mark_sync_snapshot_message(&account.id, &persisted_id)?;
+                }
             }
         }
         changed = changed.saturating_add(1);
@@ -1156,31 +1767,43 @@ pub async fn start_sync(
                     phase: "syncing",
                     processed: changed,
                     total: Some(total),
-                    has_more: batch.has_more,
+                    has_more,
                     status_message: Some("Indexing provider changes securely."),
                 },
             );
         }
     }
-    if let Some(cursor) = &batch.next_cursor {
+    if let Some(cursor) = batch.next_cursor {
         state.storage.upsert_sync_cursor(&SyncCursorRecord {
             account_id: account.id.clone(),
             scope: "account".into(),
-            cursor: cursor.clone(),
+            cursor,
             updated_at: now,
         })?;
     }
+    if snapshot_active && !has_more {
+        state.storage.finish_sync_snapshot(&account.id)?;
+    }
+    append_audit(
+        &state.storage,
+        None,
+        Some(&account.id),
+        "sync_completed",
+        "allowed",
+        "A bounded provider sync pass completed.",
+        now as u64,
+    )?;
     let outcome = SyncOutcome {
         account_id: account.id,
-        phase: if batch.has_more {
+        phase: if has_more {
             "more_available"
         } else {
             "complete"
         },
         processed: changed,
         total: Some(total),
-        has_more: batch.has_more,
-        status_message: Some(if batch.has_more {
+        has_more,
+        status_message: Some(if has_more {
             "This bounded sync pass is complete; more changes are available."
         } else {
             "Secure sync is complete."
@@ -1188,6 +1811,20 @@ pub async fn start_sync(
     };
     emit_sync_progress(&app, outcome.clone());
     Ok(outcome)
+}
+
+fn emit_sync_failure(app: &AppHandle, account_id: &str) {
+    emit_sync_progress(
+        app,
+        SyncOutcome {
+            account_id: account_id.to_owned(),
+            phase: "failed",
+            processed: 0,
+            total: None,
+            has_more: false,
+            status_message: Some("The provider sync could not be completed."),
+        },
+    );
 }
 
 fn emit_sync_progress(app: &AppHandle, progress: SyncOutcome) {
@@ -1298,6 +1935,9 @@ pub async fn execute_plan(
 ) -> Result<PlanExecution, CommandError> {
     validate_id(&request.plan_id)?;
     let stored = load_plan(&state.storage, &request.plan_id)?;
+    if !matches!(&stored.operation, PlannedOperation::Disconnect { .. }) {
+        return Err(CommandError::invalid());
+    }
     let current_versions = current_versions(&state.storage, &stored.plan)?;
     let now = now_ms()?;
     let authorization = state.policy()?.authorize_execution(
@@ -1342,6 +1982,7 @@ pub async fn execute_plan(
                 state.storage.delete_account(account_id.as_str())?;
                 Ok("The account was disconnected.")
             }
+            PlannedOperation::Send { .. } => Err(CommandError::invalid()),
         }
     }
     .await;
@@ -1534,7 +2175,10 @@ fn account_view(
         } else {
             "attention"
         },
-        last_synced_at: None,
+        last_synced_at: state
+            .storage
+            .get_sync_cursor(&record.id, "account")?
+            .map(|cursor| timestamp(cursor.updated_at)),
         status_message: if gmail_authorized {
             None
         } else {
@@ -1591,7 +2235,7 @@ fn stored_message_view(
         .collect();
     let remote_content_blocked = message.body.html.is_some();
     let recipients = parse_addresses(&message.recipients);
-    let body_text = sanitize_body_text(message.body.text.as_deref().unwrap_or_default());
+    let body_text = safe_body_text(message.body.text.as_deref(), message.body.html.as_deref());
     let mut summary = message_summary(message);
     summary.has_attachments |= !attachments.is_empty();
     Ok(SanitizedMessage {
@@ -1650,7 +2294,7 @@ fn provider_message_view(account_id: String, message: ProviderMessage) -> Saniti
         },
         recipients,
         cc,
-        body_text: sanitize_body_text(message.text_body.as_deref().unwrap_or_default()),
+        body_text: safe_body_text(message.text_body.as_deref(), message.html_body.as_deref()),
         remote_content_blocked: message.html_body.is_some(),
         attachments,
     }
@@ -1671,6 +2315,20 @@ fn plan_view(plan: &ActionPlan) -> AgentPlanView {
     } else {
         "low"
     };
+    let mut preview = vec![PlanPreviewField {
+        label: "Affected items".into(),
+        value: plan.preview.affected_count.to_string(),
+    }];
+    preview.extend(plan.preview.changes.iter().map(|change| {
+        let (label, value) = change
+            .description
+            .split_once(": ")
+            .unwrap_or(("Change", change.description.as_str()));
+        PlanPreviewField {
+            label: bounded_output(label, 128),
+            value: bounded_output(value, 1_000),
+        }
+    }));
     AgentPlanView {
         id: plan.plan_id.clone(),
         action: format!("{:?}", plan.action).to_lowercase(),
@@ -1687,10 +2345,7 @@ fn plan_view(plan: &ActionPlan) -> AgentPlanView {
                 detail: change.description.clone(),
             })
             .collect(),
-        preview: vec![PlanPreviewField {
-            label: "Affected items".into(),
-            value: plan.preview.affected_count.to_string(),
-        }],
+        preview,
         required_confirmation: required_confirmation(plan).into(),
         created_at: timestamp(plan.created_at_ms as i64),
         expires_at: timestamp(plan.expires_at_ms as i64),
@@ -1968,6 +2623,40 @@ fn sanitize_body_text(value: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+fn safe_body_text(text: Option<&str>, html: Option<&str>) -> String {
+    if let Some(text) = text {
+        return sanitize_body_text(text);
+    }
+    let Some(html) = html else {
+        return String::new();
+    };
+    let mut builder = ammonia::Builder::default();
+    builder.rm_tags(&[
+        "img", "form", "iframe", "object", "embed", "svg", "math", "style",
+    ]);
+    let cleaned = builder.clean(html).to_string();
+    let mut plain = String::with_capacity(cleaned.len());
+    let mut in_tag = false;
+    for character in cleaned.chars() {
+        match character {
+            '<' => in_tag = true,
+            '>' if in_tag => {
+                in_tag = false;
+                plain.push(' ');
+            }
+            _ if !in_tag => plain.push(character),
+            _ => {}
+        }
+    }
+    let plain = plain
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+    sanitize_body_text(&plain)
 }
 
 fn now_ms() -> Result<u64, CommandError> {

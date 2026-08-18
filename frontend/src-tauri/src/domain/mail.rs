@@ -555,6 +555,20 @@ pub struct DraftResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct DeleteDraftRequest {
+    pub account_id: AccountId,
+    pub draft_id: DraftId,
+}
+
+impl Validate for DeleteDraftRequest {
+    fn validate(&self) -> Result<(), ValidationError> {
+        self.account_id.validate()?;
+        self.draft_id.validate()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SendRequest {
     pub account_id: AccountId,
     pub draft_id: DraftId,

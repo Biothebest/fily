@@ -19,9 +19,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::{
     domain::mail::{
         AccountId, Attachment, AttachmentId, ConnectRequest, ConnectedAccount, CredentialId,
-        DisconnectRequest, DraftId, DraftRequest, DraftResult, EmailAddress, Folder, FolderId,
-        FolderRole, ListFoldersRequest, Message, MessageId, MessageSummary, MoveRequest,
-        MutationRequest, MutationResult, ProviderKind, RetrieveRequest, SearchRequest,
+        DeleteDraftRequest, DisconnectRequest, DraftId, DraftRequest, DraftResult, EmailAddress,
+        Folder, FolderId, FolderRole, ListFoldersRequest, Message, MessageId, MessageSummary,
+        MoveRequest, MutationRequest, MutationResult, ProviderKind, RetrieveRequest, SearchRequest,
         SearchResults, SendRequest, SendResult, SyncBatch, SyncChange, SyncRequest, Validate,
         MAX_BODY_BYTES,
     },
@@ -68,6 +68,9 @@ impl Drop for GmailOAuthCompletionInput {
 /// checking that their opaque IDs are non-empty.
 pub trait GmailAuthorizationGate: Send + Sync {
     fn authorize_draft(&self, _request: &DraftRequest) -> bool {
+        false
+    }
+    fn authorize_delete_draft(&self, _request: &DeleteDraftRequest) -> bool {
         false
     }
     fn authorize_send(&self, _request: &SendRequest) -> bool {
@@ -827,8 +830,30 @@ impl MailProvider for GmailProvider {
         if !request.attachment_ids.is_empty() {
             return Err(ProviderError::Unsupported);
         }
-        let raw = build_mime(&request)?;
-        let body = Some(json!({ "message": { "raw": URL_SAFE_NO_PAD.encode(raw.as_bytes()) } }));
+        let reply = if let Some(message_id) = &request.in_reply_to {
+            let message = self
+                .get_gmail_message(&request.account_id, message_id.as_str(), false)
+                .await?;
+            let headers = header_map(message.payload.as_ref());
+            let rfc_message_id = header(&headers, "message-id").and_then(safe_rfc_message_id);
+            Some((message.thread_id, rfc_message_id))
+        } else {
+            None
+        };
+        let raw = build_mime(
+            &request,
+            reply
+                .as_ref()
+                .and_then(|(_, message_id)| message_id.as_deref()),
+        )?;
+        let mut message_body = json!({ "raw": URL_SAFE_NO_PAD.encode(raw.as_bytes()) });
+        if let Some(thread_id) = reply
+            .as_ref()
+            .and_then(|(thread_id, _)| thread_id.as_deref())
+        {
+            message_body["threadId"] = Value::String(thread_id.to_owned());
+        }
+        let body = Some(json!({ "message": message_body }));
         let response: GmailDraft = if let Some(draft_id) = &request.draft_id {
             self.api_json(
                 &request.account_id,
@@ -846,6 +871,22 @@ impl MailProvider for GmailProvider {
             draft_id: DraftId::new(response.id)?,
             updated_at_ms: unix_millis(),
         })
+    }
+
+    async fn delete_draft(&self, request: DeleteDraftRequest) -> ProviderResult<()> {
+        request.validate()?;
+        if !self.authorizer.authorize_delete_draft(&request) {
+            return Err(ProviderError::Unauthorized);
+        }
+        self.api_response(
+            &request.account_id,
+            Method::DELETE,
+            &["drafts", request.draft_id.as_str()],
+            &[],
+            None,
+        )
+        .await?;
+        Ok(())
     }
 
     async fn send(&self, request: SendRequest) -> ProviderResult<SendResult> {
@@ -1595,7 +1636,7 @@ fn sanitize_html(value: &str) -> String {
     builder.clean(value).to_string()
 }
 
-fn build_mime(request: &DraftRequest) -> ProviderResult<String> {
+fn build_mime(request: &DraftRequest, reply_message_id: Option<&str>) -> ProviderResult<String> {
     let mut headers = vec![
         format!("To: {}", format_addresses(&request.to)),
         format!("Subject: {}", request.subject),
@@ -1607,8 +1648,9 @@ fn build_mime(request: &DraftRequest) -> ProviderResult<String> {
     if !request.bcc.is_empty() {
         headers.push(format!("Bcc: {}", format_addresses(&request.bcc)));
     }
-    if let Some(id) = &request.in_reply_to {
-        headers.push(format!("In-Reply-To: <{}>", id.as_str()));
+    if let Some(id) = reply_message_id {
+        headers.push(format!("In-Reply-To: <{id}>"));
+        headers.push(format!("References: <{id}>"));
     }
     let body = match (&request.text_body, &request.html_body) {
         (Some(text), Some(html)) => {
@@ -1632,6 +1674,20 @@ fn build_mime(request: &DraftRequest) -> ProviderResult<String> {
         }
     };
     Ok(format!("{}\r\n\r\n{}", headers.join("\r\n"), body))
+}
+
+fn safe_rfc_message_id(value: &str) -> Option<String> {
+    let value = value.trim().trim_start_matches('<').trim_end_matches('>');
+    if value.is_empty()
+        || value.len() > 998
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || !byte.is_ascii())
+    {
+        None
+    } else {
+        Some(value.to_owned())
+    }
 }
 
 fn format_addresses(addresses: &[EmailAddress]) -> String {

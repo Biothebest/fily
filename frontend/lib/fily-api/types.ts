@@ -115,6 +115,44 @@ export interface BootstrapData {
   messages: MessageSummary[]
 }
 
+export interface MessagePage {
+  messages: MessageSummary[]
+  nextCursor?: string | null
+}
+
+export interface DraftInput {
+  accountId: OpaqueId
+  to: MailAddress[]
+  cc: MailAddress[]
+  bcc: MailAddress[]
+  subject: string
+  textBody?: string | null
+  attachmentIds: OpaqueId[]
+}
+
+export interface DraftView extends DraftInput {
+  id: OpaqueId
+  inReplyTo?: OpaqueId | null
+  updatedAt: string
+}
+
+export interface DraftPage {
+  drafts: DraftView[]
+  nextCursor?: string | null
+}
+
+export interface DeleteDraftResult {
+  deleted: boolean
+}
+
+export interface SendExecution {
+  planId: OpaqueId
+  status: PlanStatus
+  messageId: OpaqueId
+  sentAt: string
+  summary: string
+}
+
 
 export interface PlanStep {
   label: string
@@ -177,7 +215,8 @@ export interface AuditPage {
 
 export interface FilyApi {
   getBootstrap(messageLimit: number): Promise<BootstrapData>
-  getMessage(messageId: OpaqueId): Promise<SanitizedMessage>
+  listFolders(accountId: OpaqueId): Promise<MailboxFolder[]>
+  getMessage(accountId: OpaqueId, messageId: OpaqueId): Promise<SanitizedMessage>
   searchMessages(query: string, limit?: number): Promise<SearchHit[]>
   getAccounts(): Promise<ConnectedAccount[]>
   beginAccountConnection(input: AccountConnectionInput): Promise<AccountConnection>
@@ -192,4 +231,12 @@ export interface FilyApi {
   approveAgentPlan(planId: OpaqueId, confirmation: string): Promise<AgentPlan>
   executeAgentPlan(planId: OpaqueId): Promise<PlanExecution>
   getAuditHistory(limit?: number, cursor?: string): Promise<AuditPage>
+  listMessages(accountId: OpaqueId, folderId?: OpaqueId, cursor?: string, limit?: number): Promise<MessagePage>
+  createDraft(input: DraftInput): Promise<DraftView>
+  updateDraft(draftId: OpaqueId, input: DraftInput): Promise<DraftView>
+  listDrafts(accountId: OpaqueId, cursor?: string, limit?: number): Promise<DraftPage>
+  deleteDraft(accountId: OpaqueId, draftId: OpaqueId): Promise<DeleteDraftResult>
+  createReplyDraft(accountId: OpaqueId, messageId: OpaqueId): Promise<DraftView>
+  createSendPreview(accountId: OpaqueId, draftId: OpaqueId): Promise<AgentPlan>
+  executeSend(planId: OpaqueId): Promise<SendExecution>
 }

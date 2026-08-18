@@ -22,11 +22,12 @@ use zeroize::Zeroizing;
 
 use crate::{
     domain::mail::{
-        AccountId, Attachment, AttachmentId, ConnectRequest, ConnectedAccount, DisconnectRequest,
-        DraftId, DraftRequest, DraftResult, EmailAddress, Folder, FolderId, FolderRole,
-        ListFoldersRequest, Message, MessageId, MessageSummary, MoveRequest, MutationRequest,
-        MutationResult, ProviderEndpoint, ProviderKind, RetrieveRequest, SearchRequest,
-        SearchResults, SendRequest, SendResult, SyncBatch, SyncChange, SyncRequest, Validate,
+        AccountId, Attachment, AttachmentId, ConnectRequest, ConnectedAccount, DeleteDraftRequest,
+        DisconnectRequest, DraftId, DraftRequest, DraftResult, EmailAddress, Folder, FolderId,
+        FolderRole, ListFoldersRequest, Message, MessageId, MessageSummary, MoveRequest,
+        MutationRequest, MutationResult, ProviderEndpoint, ProviderKind, RetrieveRequest,
+        SearchRequest, SearchResults, SendRequest, SendResult, SyncBatch, SyncChange, SyncRequest,
+        Validate,
     },
     providers::{MailProvider, ProviderError, ProviderResult},
     vault::CredentialVault,
@@ -530,6 +531,26 @@ impl GenericImapProvider {
         })
     }
 
+    fn delete_draft_blocking(
+        &self,
+        account: &AccountConfig,
+        request: DeleteDraftRequest,
+    ) -> ProviderResult<()> {
+        let (mailbox, uid) = decode_draft_id(&request.draft_id)?;
+        let mut session = self.open_session(account)?;
+        session
+            .select(&mailbox)
+            .map_err(|_| ProviderError::NotFound)?;
+        session
+            .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
+            .map_err(|_| ProviderError::Network)?;
+        session
+            .uid_expunge(uid.to_string())
+            .map_err(|_| ProviderError::Network)?;
+        let _ = session.logout();
+        Ok(())
+    }
+
     fn send_blocking(
         &self,
         account: &AccountConfig,
@@ -730,6 +751,13 @@ impl MailProvider for GenericImapProvider {
         let account = self.account(&request.account_id)?;
         let adapter = self.clone();
         run_blocking(move || adapter.draft_blocking(&account, request)).await
+    }
+
+    async fn delete_draft(&self, request: DeleteDraftRequest) -> ProviderResult<()> {
+        request.validate()?;
+        let account = self.account(&request.account_id)?;
+        let adapter = self.clone();
+        run_blocking(move || adapter.delete_draft_blocking(&account, request)).await
     }
 
     async fn send(&self, request: SendRequest) -> ProviderResult<SendResult> {

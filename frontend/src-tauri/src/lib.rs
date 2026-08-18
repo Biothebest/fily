@@ -7,6 +7,7 @@ mod native_credentials;
 pub mod providers;
 pub mod recovery;
 pub mod storage;
+pub mod sync;
 pub mod vault;
 
 use tauri::Manager;
@@ -40,6 +41,12 @@ pub fn run() {
             commands::get_message,
             commands::search_messages,
             commands::create_draft,
+            commands::update_draft,
+            commands::list_drafts,
+            commands::delete_draft,
+            commands::create_reply_draft,
+            commands::create_send_preview,
+            commands::execute_send,
             commands::list_plans,
             commands::approve_plan,
             commands::execute_plan,

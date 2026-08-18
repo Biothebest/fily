@@ -1,6 +1,7 @@
 "use client"
 
-import { FileText, ShieldCheck } from "lucide-react"
+import { FileText, Reply, ReplyAll, ShieldCheck } from "lucide-react"
+import { Button } from "@/components/ui/button"
 import type { SanitizedMessage } from "@/lib/fily-api"
 
 function addressList(message: SanitizedMessage): string {
@@ -13,10 +14,14 @@ export function MessageViewer({
   message,
   loading,
   error,
+  onReply,
+  onReplyAll,
 }: {
   message: SanitizedMessage | null
   loading: boolean
   error: string | null
+  onReply: () => void
+  onReplyAll: () => void
 }) {
   if (loading) {
     return <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">Opening message…</div>
@@ -58,7 +63,13 @@ export function MessageViewer({
             </p>
             <p className="mt-0.5 text-xs text-muted-foreground">To: {recipients || "Undisclosed recipients"}</p>
           </div>
-          <time className="shrink-0 text-xs text-muted-foreground">{message.receivedAt}</time>
+          <div className="flex shrink-0 flex-col items-end gap-3">
+            <time className="text-xs text-muted-foreground">{message.receivedAt}</time>
+            <div className="flex gap-2">
+              <Button type="button" variant="outline" size="sm" onClick={onReply}><Reply /> Reply</Button>
+              <Button type="button" variant="outline" size="sm" onClick={onReplyAll}><ReplyAll /> Reply all</Button>
+            </div>
+          </div>
         </div>
       </header>
 

@@ -4,10 +4,10 @@ use async_trait::async_trait;
 
 use crate::{
     domain::mail::{
-        ConnectRequest, ConnectedAccount, DisconnectRequest, DraftRequest, DraftResult, Folder,
-        ListFoldersRequest, Message, MoveRequest, MutationRequest, MutationResult, ProviderKind,
-        RetrieveRequest, SearchRequest, SearchResults, SendRequest, SendResult, SyncBatch,
-        SyncRequest,
+        ConnectRequest, ConnectedAccount, DeleteDraftRequest, DisconnectRequest, DraftRequest,
+        DraftResult, Folder, ListFoldersRequest, Message, MoveRequest, MutationRequest,
+        MutationResult, ProviderKind, RetrieveRequest, SearchRequest, SearchResults, SendRequest,
+        SendResult, SyncBatch, SyncRequest,
     },
     providers::{
         imap::{GenericImapProvider, SmtpSecurity, TrustedImapConfig},
@@ -68,6 +68,9 @@ impl MailProvider for ICloudProvider {
     }
     async fn draft(&self, request: DraftRequest) -> ProviderResult<DraftResult> {
         self.inner.draft(request).await
+    }
+    async fn delete_draft(&self, request: DeleteDraftRequest) -> ProviderResult<()> {
+        self.inner.delete_draft(request).await
     }
     async fn send(&self, request: SendRequest) -> ProviderResult<SendResult> {
         self.inner.send(request).await

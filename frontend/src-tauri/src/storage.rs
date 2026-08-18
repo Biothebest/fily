@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::Path,
     sync::{Mutex, MutexGuard},
@@ -19,9 +20,11 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::vault::{CredentialVault, VaultError};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const NONCE_LEN: usize = 24;
-const MAX_ID_LEN: usize = 192;
+const MAX_ID_LEN: usize = 1_024;
+const MAX_REMOTE_FOLDER_ID_LEN: usize = 512;
+const MAX_REMOTE_MESSAGE_ID_LEN: usize = 1_024;
 const MAX_SHORT_TEXT: usize = 512;
 const MAX_LONG_TEXT: usize = 64 * 1024;
 const MAX_JSON_BYTES: usize = 4 * 1024 * 1024;
@@ -119,6 +122,15 @@ pub struct AttachmentRecord {
     pub content_id: Option<String>,
     pub content: Vec<u8>,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DraftRecord {
+    pub id: String,
+    pub account_id: String,
+    pub remote_id: String,
+    pub payload: Value,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -343,6 +355,54 @@ impl Storage {
         collect_rows(rows)
     }
 
+    /// Replaces an account's provider folder snapshot in one transaction. Removed folders only
+    /// remove their associations; messages remain available until the provider reports deletion.
+    pub fn reconcile_folders(
+        &self,
+        account_id: &str,
+        records: &[FolderRecord],
+    ) -> Result<(), StorageError> {
+        validate_id(account_id, "account id")?;
+        let mut retained = BTreeSet::new();
+        for record in records {
+            validate_folder(record)?;
+            if record.account_id != account_id {
+                return Err(StorageError::InvalidInput("folder account"));
+            }
+            retained.insert(record.id.clone());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        for record in records {
+            transaction.execute(
+                "INSERT INTO folders (id,account_id,remote_id,parent_id,name,role,unread_count,total_count,updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                 ON CONFLICT(id) DO UPDATE SET account_id=excluded.account_id,
+                   remote_id=excluded.remote_id,parent_id=excluded.parent_id,name=excluded.name,
+                   role=excluded.role,unread_count=excluded.unread_count,
+                   total_count=excluded.total_count,updated_at=excluded.updated_at",
+                params![record.id,record.account_id,record.remote_id,record.parent_id,record.name,record.role,record.unread_count,record.total_count,record.updated_at],
+            )?;
+        }
+        let stale_ids = {
+            let mut statement =
+                transaction.prepare("SELECT id FROM folders WHERE account_id=?1")?;
+            let rows = statement.query_map([account_id], |row| row.get::<_, String>(0))?;
+            collect_rows(rows)?
+                .into_iter()
+                .filter(|id| !retained.contains(id))
+                .collect::<Vec<_>>()
+        };
+        for id in stale_ids {
+            transaction.execute(
+                "DELETE FROM folders WHERE id=?1 AND account_id=?2",
+                params![id, account_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn delete_folder(&self, id: &str) -> Result<bool, StorageError> {
         validate_id(id, "folder id")?;
         Ok(self
@@ -354,7 +414,9 @@ impl Storage {
     pub fn upsert_message(&self, record: &MessageRecord) -> Result<(), StorageError> {
         validate_message(record)?;
         let (nonce, ciphertext) = self.encrypt("messages", &record.id, "body", &record.body)?;
-        self.lock()?.execute(
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
             "INSERT INTO messages (id,account_id,folder_id,remote_id,thread_id,subject,sender,recipients,snippet,flags,sent_at,received_at,size_bytes,body_nonce,body_ciphertext,updated_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
              ON CONFLICT(id) DO UPDATE SET account_id=excluded.account_id, folder_id=excluded.folder_id,
@@ -365,7 +427,81 @@ impl Storage {
                body_ciphertext=excluded.body_ciphertext, updated_at=excluded.updated_at",
             params![record.id,record.account_id,record.folder_id,record.remote_id,record.thread_id,record.subject,record.sender,record.recipients,record.snippet,record.flags,record.sent_at,record.received_at,record.size_bytes,nonce,ciphertext,record.updated_at],
         )?;
+        transaction.execute(
+            "DELETE FROM message_folders WHERE message_id=?1",
+            [&record.id],
+        )?;
+        if let Some(folder_id) = &record.folder_id {
+            let inserted = transaction.execute(
+                "INSERT INTO message_folders(message_id,folder_id)
+                 SELECT ?1,id FROM folders WHERE id=?2 AND account_id=?3",
+                params![record.id, folder_id, record.account_id],
+            )?;
+            if inserted != 1 {
+                return Err(StorageError::InvalidInput("message folder"));
+            }
+        }
+        transaction.commit()?;
         Ok(())
+    }
+
+    /// Persists one provider summary and replaces its complete folder membership atomically.
+    ///
+    /// Metadata-only sync must not erase a body fetched earlier, so conflict updates intentionally
+    /// retain the existing encrypted body and size.
+    pub fn upsert_synced_message(
+        &self,
+        record: &MessageRecord,
+        folder_ids: &[String],
+    ) -> Result<String, StorageError> {
+        validate_message(record)?;
+        for folder_id in folder_ids {
+            validate_id(folder_id, "folder id")?;
+        }
+        if record
+            .folder_id
+            .as_ref()
+            .is_some_and(|primary| !folder_ids.iter().any(|folder| folder == primary))
+        {
+            return Err(StorageError::InvalidInput("primary folder"));
+        }
+        let mut connection = self.lock()?;
+        let effective_id = connection
+            .query_row(
+                "SELECT id FROM messages WHERE account_id=?1 AND remote_id=?2",
+                params![record.account_id, record.remote_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| record.id.clone());
+        let (nonce, ciphertext) = self.encrypt("messages", &effective_id, "body", &record.body)?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO messages (id,account_id,folder_id,remote_id,thread_id,subject,sender,recipients,snippet,flags,sent_at,received_at,size_bytes,body_nonce,body_ciphertext,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+             ON CONFLICT(id) DO UPDATE SET account_id=excluded.account_id, folder_id=excluded.folder_id,
+               remote_id=excluded.remote_id, thread_id=excluded.thread_id, subject=excluded.subject,
+               sender=excluded.sender, recipients=excluded.recipients, snippet=excluded.snippet,
+               flags=excluded.flags, sent_at=excluded.sent_at, received_at=excluded.received_at,
+               updated_at=excluded.updated_at",
+            params![effective_id,record.account_id,record.folder_id,record.remote_id,record.thread_id,record.subject,record.sender,record.recipients,record.snippet,record.flags,record.sent_at,record.received_at,record.size_bytes,nonce,ciphertext,record.updated_at],
+        )?;
+        transaction.execute(
+            "DELETE FROM message_folders WHERE message_id=?1",
+            [&effective_id],
+        )?;
+        for folder_id in folder_ids {
+            let inserted = transaction.execute(
+                "INSERT INTO message_folders (message_id,folder_id)
+                 SELECT ?1,id FROM folders WHERE id=?2 AND account_id=?3",
+                params![effective_id, folder_id, record.account_id],
+            )?;
+            if inserted != 1 {
+                return Err(StorageError::InvalidInput("message folder"));
+            }
+        }
+        transaction.commit()?;
+        Ok(effective_id)
     }
 
     pub fn get_message(&self, id: &str) -> Result<Option<MessageRecord>, StorageError> {
@@ -388,7 +524,7 @@ impl Storage {
         remote_id: &str,
     ) -> Result<Option<String>, StorageError> {
         validate_id(account_id, "account id")?;
-        validate_id(remote_id, "remote message id")?;
+        validate_opaque_id(remote_id, MAX_REMOTE_MESSAGE_ID_LEN, "remote message id")?;
         self.lock()?
             .query_row(
                 "SELECT id FROM messages WHERE account_id=?1 AND remote_id=?2",
@@ -413,12 +549,70 @@ impl Storage {
         let ids = {
             let connection = self.lock()?;
             let mut statement = connection.prepare(
-                "SELECT id FROM messages WHERE account_id=?1 AND (?2 IS NULL OR folder_id=?2)
-                 ORDER BY received_at DESC, id LIMIT ?3",
+                "SELECT m.id FROM messages m
+                 WHERE m.account_id=?1 AND (
+                   ?2 IS NULL OR EXISTS (
+                     SELECT 1 FROM message_folders mf
+                     WHERE mf.message_id=m.id AND mf.folder_id=?2
+                   )
+                 )
+                 ORDER BY m.received_at DESC, m.id LIMIT ?3",
             )?;
             let rows = statement.query_map(params![account_id, folder_id, limit], |row| {
                 row.get::<_, String>(0)
             })?;
+            collect_rows(rows)?
+        };
+        ids.iter()
+            .map(|id| self.get_message(id)?.ok_or(StorageError::CorruptData))
+            .collect()
+    }
+    pub fn list_messages_page(
+        &self,
+        account_id: &str,
+        folder_id: Option<&str>,
+        after_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<MessageRecord>, StorageError> {
+        validate_id(account_id, "account id")?;
+        if let Some(folder_id) = folder_id {
+            validate_id(folder_id, "folder id")?;
+        }
+        validate_limit(limit)?;
+        let after = after_id
+            .map(|id| {
+                let record = self
+                    .get_message(id)?
+                    .ok_or(StorageError::InvalidInput("message cursor"))?;
+                if record.account_id != account_id {
+                    return Err(StorageError::InvalidInput("message cursor"));
+                }
+                Ok((record.received_at, record.id))
+            })
+            .transpose()?;
+        let ids = {
+            let connection = self.lock()?;
+            let mut statement = connection.prepare(
+                "SELECT m.id FROM messages m
+                 WHERE m.account_id=?1
+                   AND (?2 IS NULL OR EXISTS (
+                     SELECT 1 FROM message_folders mf
+                     WHERE mf.message_id=m.id AND mf.folder_id=?2
+                   ))
+                   AND (?3 IS NULL OR m.received_at < ?3
+                        OR (m.received_at = ?3 AND m.id > ?4))
+                 ORDER BY m.received_at DESC, m.id LIMIT ?5",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    account_id,
+                    folder_id,
+                    after.as_ref().map(|value| value.0),
+                    after.as_ref().map(|value| value.1.as_str()),
+                    limit
+                ],
+                |row| row.get::<_, String>(0),
+            )?;
             collect_rows(rows)?
         };
         ids.iter()
@@ -431,6 +625,123 @@ impl Storage {
         Ok(self
             .lock()?
             .execute("DELETE FROM messages WHERE id=?1", [id])?
+            == 1)
+    }
+
+    pub fn delete_message_by_remote_id(
+        &self,
+        account_id: &str,
+        remote_id: &str,
+    ) -> Result<bool, StorageError> {
+        validate_id(account_id, "account id")?;
+        validate_opaque_id(remote_id, MAX_REMOTE_MESSAGE_ID_LEN, "remote message id")?;
+        Ok(self.lock()?.execute(
+            "DELETE FROM messages WHERE account_id=?1 AND remote_id=?2",
+            params![account_id, remote_id],
+        )? == 1)
+    }
+
+    pub fn upsert_draft(&self, record: &DraftRecord) -> Result<(), StorageError> {
+        validate_draft(record)?;
+        let (nonce, ciphertext) = self.encrypt("drafts", &record.id, "payload", &record.payload)?;
+        self.lock()?.execute(
+            "INSERT INTO drafts (id,account_id,remote_id,payload_nonce,payload_ciphertext,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(id) DO UPDATE SET account_id=excluded.account_id,
+               remote_id=excluded.remote_id, payload_nonce=excluded.payload_nonce,
+               payload_ciphertext=excluded.payload_ciphertext, updated_at=excluded.updated_at",
+            params![
+                record.id,
+                record.account_id,
+                record.remote_id,
+                nonce,
+                ciphertext,
+                record.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_draft(&self, id: &str) -> Result<Option<DraftRecord>, StorageError> {
+        validate_id(id, "draft id")?;
+        let stored = self
+            .lock()?
+            .query_row(
+                "SELECT id,account_id,remote_id,payload_nonce,payload_ciphertext,updated_at
+                 FROM drafts WHERE id=?1",
+                [id],
+                |row| {
+                    Ok((
+                        DraftRecord {
+                            id: row.get(0)?,
+                            account_id: row.get(1)?,
+                            remote_id: row.get(2)?,
+                            payload: Value::Null,
+                            updated_at: row.get(5)?,
+                        },
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        stored
+            .map(|(mut record, nonce, ciphertext)| {
+                record.payload =
+                    self.decrypt("drafts", &record.id, "payload", &nonce, &ciphertext)?;
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    pub fn list_drafts(
+        &self,
+        account_id: &str,
+        after_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<DraftRecord>, StorageError> {
+        validate_id(account_id, "account id")?;
+        validate_limit(limit)?;
+        let after = after_id
+            .map(|id| {
+                let record = self
+                    .get_draft(id)?
+                    .ok_or(StorageError::InvalidInput("draft cursor"))?;
+                if record.account_id != account_id {
+                    return Err(StorageError::InvalidInput("draft cursor"));
+                }
+                Ok((record.updated_at, record.id))
+            })
+            .transpose()?;
+        let ids = {
+            let connection = self.lock()?;
+            let mut statement = connection.prepare(
+                "SELECT id FROM drafts
+                 WHERE account_id=?1
+                   AND (?2 IS NULL OR updated_at < ?2 OR (updated_at = ?2 AND id < ?3))
+                 ORDER BY updated_at DESC, id DESC LIMIT ?4",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    account_id,
+                    after.as_ref().map(|value| value.0),
+                    after.as_ref().map(|value| value.1.as_str()),
+                    limit
+                ],
+                |row| row.get::<_, String>(0),
+            )?;
+            collect_rows(rows)?
+        };
+        ids.iter()
+            .map(|id| self.get_draft(id)?.ok_or(StorageError::CorruptData))
+            .collect()
+    }
+
+    pub fn delete_draft(&self, id: &str) -> Result<bool, StorageError> {
+        validate_id(id, "draft id")?;
+        Ok(self
+            .lock()?
+            .execute("DELETE FROM drafts WHERE id=?1", [id])?
             == 1)
     }
 
@@ -518,6 +829,77 @@ impl Storage {
             "DELETE FROM sync_cursors WHERE account_id=?1 AND scope=?2",
             params![account_id, scope],
         )? == 1)
+    }
+
+    pub fn begin_sync_snapshot(&self, account_id: &str, now: i64) -> Result<(), StorageError> {
+        validate_id(account_id, "account id")?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM sync_snapshot_seen WHERE account_id=?1",
+            [account_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO sync_cursors(account_id,scope,cursor,updated_at)
+             VALUES (?1,'account-snapshot','in_progress',?2)
+             ON CONFLICT(account_id,scope) DO UPDATE SET cursor='in_progress',updated_at=excluded.updated_at",
+            params![account_id, now],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_sync_snapshot_message(
+        &self,
+        account_id: &str,
+        message_id: &str,
+    ) -> Result<(), StorageError> {
+        validate_id(account_id, "account id")?;
+        validate_id(message_id, "message id")?;
+        self.lock()?.execute(
+            "INSERT OR IGNORE INTO sync_snapshot_seen(account_id,message_id)
+             SELECT ?1,?2 WHERE EXISTS (
+               SELECT 1 FROM sync_cursors WHERE account_id=?1 AND scope='account-snapshot'
+             )",
+            params![account_id, message_id],
+        )?;
+        Ok(())
+    }
+
+    /// Completes a full bounded snapshot. Only messages absent from every completed page are
+    /// removed, making provider moves and deletes safe across continuation requests and crashes.
+    pub fn finish_sync_snapshot(&self, account_id: &str) -> Result<u64, StorageError> {
+        validate_id(account_id, "account id")?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let active: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_cursors
+             WHERE account_id=?1 AND scope='account-snapshot')",
+            [account_id],
+            |row| row.get(0),
+        )?;
+        if !active {
+            transaction.commit()?;
+            return Ok(0);
+        }
+        let deleted = transaction.execute(
+            "DELETE FROM messages
+             WHERE account_id=?1 AND NOT EXISTS (
+               SELECT 1 FROM sync_snapshot_seen seen
+               WHERE seen.account_id=?1 AND seen.message_id=messages.id
+             )",
+            [account_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM sync_snapshot_seen WHERE account_id=?1",
+            [account_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM sync_cursors WHERE account_id=?1 AND scope='account-snapshot'",
+            [account_id],
+        )?;
+        transaction.commit()?;
+        Ok(deleted as u64)
     }
 
     pub fn upsert_attachment(&self, record: &AttachmentRecord) -> Result<(), StorageError> {
@@ -937,8 +1319,13 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StorageError> {
     }
     if version == 0 {
         create_schema(&transaction)?;
-    } else if version < 2 {
-        create_migration_checkpoint_schema(&transaction)?;
+    } else {
+        if version < 2 {
+            create_migration_checkpoint_schema(&transaction)?;
+        }
+        if version < 3 {
+            create_mailbox_sync_schema(&transaction, true)?;
+        }
     }
     if version < SCHEMA_VERSION {
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1009,6 +1396,7 @@ fn create_schema(transaction: &Transaction<'_>) -> Result<(), StorageError> {
          END;",
     )?;
     create_migration_checkpoint_schema(transaction)?;
+    create_mailbox_sync_schema(transaction, false)?;
     Ok(())
 }
 
@@ -1019,6 +1407,39 @@ fn create_migration_checkpoint_schema(transaction: &Transaction<'_>) -> Result<(
            accounts INTEGER NOT NULL, messages INTEGER NOT NULL, skipped INTEGER NOT NULL,
            completed_at INTEGER NOT NULL);",
     )?;
+    Ok(())
+}
+
+fn create_mailbox_sync_schema(
+    transaction: &Transaction<'_>,
+    backfill_membership: bool,
+) -> Result<(), StorageError> {
+    transaction.execute_batch(
+        "CREATE TABLE message_folders (
+           message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+           folder_id TEXT NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
+           PRIMARY KEY(message_id,folder_id));
+         CREATE INDEX message_folders_folder ON message_folders(folder_id,message_id);
+         CREATE TABLE sync_snapshot_seen (
+           account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+           message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+           PRIMARY KEY(account_id,message_id));
+         CREATE TABLE drafts (
+           id TEXT PRIMARY KEY,
+           account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+           remote_id TEXT NOT NULL,
+           payload_nonce BLOB NOT NULL CHECK(length(payload_nonce)=24),
+           payload_ciphertext BLOB NOT NULL,
+           updated_at INTEGER NOT NULL,
+           UNIQUE(account_id,remote_id));",
+    )?;
+    if backfill_membership {
+        transaction.execute(
+            "INSERT INTO message_folders(message_id,folder_id)
+             SELECT id,folder_id FROM messages WHERE folder_id IS NOT NULL",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -1075,7 +1496,11 @@ fn validate_account(record: &AccountRecord) -> Result<(), StorageError> {
 fn validate_folder(record: &FolderRecord) -> Result<(), StorageError> {
     validate_id(&record.id, "folder id")?;
     validate_id(&record.account_id, "account id")?;
-    validate_id(&record.remote_id, "remote folder id")?;
+    validate_opaque_id(
+        &record.remote_id,
+        MAX_REMOTE_FOLDER_ID_LEN,
+        "remote folder id",
+    )?;
     if let Some(parent) = &record.parent_id {
         validate_id(parent, "parent folder id")?;
         if parent == &record.id {
@@ -1089,12 +1514,16 @@ fn validate_folder(record: &FolderRecord) -> Result<(), StorageError> {
 fn validate_message(record: &MessageRecord) -> Result<(), StorageError> {
     validate_id(&record.id, "message id")?;
     validate_id(&record.account_id, "account id")?;
-    validate_id(&record.remote_id, "remote message id")?;
+    validate_opaque_id(
+        &record.remote_id,
+        MAX_REMOTE_MESSAGE_ID_LEN,
+        "remote message id",
+    )?;
     if let Some(folder) = &record.folder_id {
         validate_id(folder, "folder id")?;
     }
     if let Some(thread) = &record.thread_id {
-        validate_id(thread, "thread id")?;
+        validate_opaque_id(thread, MAX_REMOTE_MESSAGE_ID_LEN, "thread id")?;
     }
     validate_text_allow_empty(&record.subject, MAX_LONG_TEXT, "subject")?;
     validate_text(&record.sender, MAX_LONG_TEXT, "sender")?;
@@ -1112,7 +1541,7 @@ fn validate_attachment(record: &AttachmentRecord) -> Result<(), StorageError> {
     validate_id(&record.id, "attachment id")?;
     validate_id(&record.message_id, "message id")?;
     if let Some(remote) = &record.remote_id {
-        validate_id(remote, "remote attachment id")?;
+        validate_opaque_id(remote, MAX_REMOTE_MESSAGE_ID_LEN, "remote attachment id")?;
     }
     validate_text(&record.filename, MAX_SHORT_TEXT, "attachment filename")?;
     validate_text(&record.media_type, MAX_SHORT_TEXT, "attachment media type")?;
@@ -1127,6 +1556,17 @@ fn validate_attachment(record: &AttachmentRecord) -> Result<(), StorageError> {
         return Err(StorageError::InvalidInput("attachment size"));
     }
     Ok(())
+}
+
+fn validate_draft(record: &DraftRecord) -> Result<(), StorageError> {
+    validate_id(&record.id, "draft id")?;
+    validate_id(&record.account_id, "account id")?;
+    validate_opaque_id(
+        &record.remote_id,
+        MAX_REMOTE_MESSAGE_ID_LEN,
+        "remote draft id",
+    )?;
+    validate_json_size(&record.payload)
 }
 
 fn validate_plan(record: &PlanRecord) -> Result<(), StorageError> {
@@ -1193,7 +1633,11 @@ fn validate_json_size(value: &Value) -> Result<(), StorageError> {
 }
 
 fn validate_id(value: &str, field: &'static str) -> Result<(), StorageError> {
-    if value.is_empty() || value.len() > MAX_ID_LEN || value.chars().any(char::is_control) {
+    validate_opaque_id(value, MAX_ID_LEN, field)
+}
+
+fn validate_opaque_id(value: &str, max: usize, field: &'static str) -> Result<(), StorageError> {
+    if value.is_empty() || value.len() > max || value.chars().any(char::is_control) {
         Err(StorageError::InvalidInput(field))
     } else {
         Ok(())

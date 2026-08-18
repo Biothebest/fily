@@ -8,19 +8,29 @@ import type {
   BootstrapData,
   ConnectedAccount,
   LegacyMigrationStatus,
+  DeleteDraftResult,
+  DraftInput,
+  DraftPage,
+  DraftView,
   FilyApi,
   OpaqueId,
   PlanExecution,
   SanitizedMessage,
+  MessagePage,
+  MailboxFolder,
   SearchHit,
   SyncProgress,
   SyncResult,
+  SendExecution,
 } from "./types"
 
 const MAX_ID_LENGTH = 256
 const MAX_QUERY_LENGTH = 1_000
 const MAX_CONFIRMATION_LENGTH = 256
 const MAX_PAGE_SIZE = 100
+const MAX_ADDRESS_LENGTH = 320
+const MAX_SUBJECT_LENGTH = 998
+const MAX_BODY_LENGTH = 2_000_000
 
 function opaqueId(value: string, label: string): string {
   const result = value.trim()
@@ -40,6 +50,26 @@ function boundedText(value: string, label: string, maximum: number): string {
 function pageSize(value: number, fallback: number): number {
   if (!Number.isFinite(value)) return fallback
   return Math.max(1, Math.min(MAX_PAGE_SIZE, Math.trunc(value)))
+}
+
+function draftRequest(input: DraftInput): Record<string, unknown> {
+  const mailboxes = (values: DraftInput["to"], label: string) =>
+    values.map((value) => ({
+      name: value.name?.trim().slice(0, 320) || undefined,
+      address: boundedText(value.address, label, MAX_ADDRESS_LENGTH).toLowerCase(),
+    }))
+  const subject = input.subject.trim().slice(0, MAX_SUBJECT_LENGTH)
+  const textBody = input.textBody ?? ""
+  if (textBody.length > MAX_BODY_LENGTH) throw new Error("Message body is too long.")
+  return {
+    accountId: opaqueId(input.accountId, "Account"),
+    to: mailboxes(input.to, "To address"),
+    cc: mailboxes(input.cc, "Cc address"),
+    bcc: mailboxes(input.bcc, "Bcc address"),
+    subject,
+    textBody,
+    attachmentIds: input.attachmentIds.map((id) => opaqueId(id, "Attachment")),
+  }
 }
 
 async function command<T>(name: string, request?: Record<string, unknown>): Promise<T> {
@@ -66,8 +96,14 @@ class TauriFilyApi implements FilyApi {
     return command("bootstrap", { messageLimit: pageSize(messageLimit, 50) })
   }
 
-  getMessage(messageId: OpaqueId): Promise<SanitizedMessage> {
-    return command("get_message", { messageId: opaqueId(messageId, "Message") })
+  listFolders(accountId: OpaqueId): Promise<MailboxFolder[]> {
+    return command("list_folders", { accountId: opaqueId(accountId, "Account") })
+  }
+  getMessage(accountId: OpaqueId, messageId: OpaqueId): Promise<SanitizedMessage> {
+    return command("get_message", {
+      accountId: opaqueId(accountId, "Account"),
+      messageId: opaqueId(messageId, "Message"),
+    })
   }
 
   searchMessages(query: string, limit = 50): Promise<SearchHit[]> {
@@ -147,6 +183,56 @@ class TauriFilyApi implements FilyApi {
     const request: Record<string, unknown> = { limit: pageSize(limit, 50) }
     if (cursor) request.cursor = opaqueId(cursor, "Audit cursor")
     return command("list_audit", request)
+  }
+
+  listMessages(accountId: OpaqueId, folderId?: OpaqueId, cursor?: string, limit = 50): Promise<MessagePage> {
+    return command("list_messages", {
+      accountId: opaqueId(accountId, "Account"),
+      folderId: folderId ? opaqueId(folderId, "Folder") : undefined,
+      cursor: cursor ? opaqueId(cursor, "Message cursor") : undefined,
+      limit: pageSize(limit, 50),
+    })
+  }
+
+  createDraft(input: DraftInput): Promise<DraftView> {
+    return command("create_draft", draftRequest(input))
+  }
+
+  updateDraft(draftId: OpaqueId, input: DraftInput): Promise<DraftView> {
+    return command("update_draft", { ...draftRequest(input), draftId: opaqueId(draftId, "Draft") })
+  }
+
+  listDrafts(accountId: OpaqueId, cursor?: string, limit = 50): Promise<DraftPage> {
+    return command("list_drafts", {
+      accountId: opaqueId(accountId, "Account"),
+      cursor: cursor ? opaqueId(cursor, "Draft cursor") : undefined,
+      limit: pageSize(limit, 50),
+    })
+  }
+
+  deleteDraft(accountId: OpaqueId, draftId: OpaqueId): Promise<DeleteDraftResult> {
+    return command("delete_draft", {
+      accountId: opaqueId(accountId, "Account"),
+      draftId: opaqueId(draftId, "Draft"),
+    })
+  }
+
+  createReplyDraft(accountId: OpaqueId, messageId: OpaqueId): Promise<DraftView> {
+    return command("create_reply_draft", {
+      accountId: opaqueId(accountId, "Account"),
+      messageId: opaqueId(messageId, "Message"),
+    })
+  }
+
+  createSendPreview(accountId: OpaqueId, draftId: OpaqueId): Promise<AgentPlan> {
+    return command("create_send_preview", {
+      accountId: opaqueId(accountId, "Account"),
+      draftId: opaqueId(draftId, "Draft"),
+    })
+  }
+
+  executeSend(planId: OpaqueId): Promise<SendExecution> {
+    return command("execute_send", { planId: opaqueId(planId, "Plan") })
   }
 }
 
