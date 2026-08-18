@@ -4,9 +4,10 @@ from __future__ import annotations
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Mapping, Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .agent import FilyAgent
+from .api_contract import openapi_document
 from .jobs import extract_job_applications
 from .store import Store
 
@@ -38,6 +39,43 @@ def _accounts(store: Store) -> list:
         )
         current["indexed_messages"] += 1
     return sorted(accounts.values(), key=lambda item: (item["provider"], item.get("email") or ""))
+
+def _applications(store: Store, limit: int) -> list:
+    return extract_job_applications(store.list_documents(), limit=limit)
+
+
+def _bootstrap(store: Store, application_limit: int) -> Dict[str, Any]:
+    accounts = _accounts(store)
+    applications = _applications(store, application_limit)
+    stage_counts: Dict[str, int] = {}
+    for application in applications:
+        stage = str(application.get("stage") or "Unknown")
+        stage_counts[stage] = stage_counts.get(stage, 0) + 1
+    return {
+        "product": {"name": "Fily", "api_version": _API_VERSION, "mode": "local"},
+        "accounts": accounts,
+        "smart_views": [
+            {
+                "id": "job-applications",
+                "label": "Job Applications",
+                "count": len(applications),
+                "stage_counts": stage_counts,
+            }
+        ],
+        "job_applications": applications,
+        "assistant": {
+            "suggestions": [
+                "Show my active job applications",
+                "Find emails that need my response",
+                "Find the invoice from Fred",
+            ]
+        },
+        "capabilities": {
+            "gmail_readonly": True,
+            "provider_mutations": False,
+            "multi_account": False,
+        },
+    }
 
 
 def _handler(store: Store):
@@ -86,6 +124,15 @@ def _handler(store: Store):
                 if parsed.path == "/v1/health":
                     self._send(200, {"status": "ok", "api_version": _API_VERSION})
                     return
+                if parsed.path == "/v1/openapi.json":
+                    self._send(200, openapi_document())
+                    return
+                if parsed.path == "/v1/bootstrap":
+                    query = parse_qs(parsed.query)
+                    raw_limit = query.get("application_limit", ["5"])[0]
+                    limit = max(1, min(int(raw_limit), 50))
+                    self._send(200, _bootstrap(store, limit))
+                    return
                 if parsed.path == "/v1/accounts":
                     self._send(200, {"accounts": _accounts(store)})
                     return
@@ -93,8 +140,23 @@ def _handler(store: Store):
                     query = parse_qs(parsed.query)
                     raw_limit = query.get("limit", ["20"])[0]
                     limit = max(1, min(int(raw_limit), 200))
-                    applications = extract_job_applications(store.list_documents(), limit=limit)
+                    applications = _applications(store, limit)
                     self._send(200, {"applications": applications, "count": len(applications)})
+                    return
+                prefix = "/v1/job-applications/"
+                if parsed.path.startswith(prefix):
+                    application_id = unquote(parsed.path[len(prefix):])
+                    if not application_id or "/" in application_id:
+                        self._send(404, {"error": "application not found"})
+                        return
+                    application = next(
+                        (item for item in _applications(store, 200) if item["id"] == application_id),
+                        None,
+                    )
+                    if application is None:
+                        self._send(404, {"error": "application not found"})
+                    else:
+                        self._send(200, {"application": application})
                     return
                 self._send(404, {"error": "not found"})
             except (TypeError, ValueError) as exc:
