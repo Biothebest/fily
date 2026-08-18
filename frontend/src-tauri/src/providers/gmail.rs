@@ -29,7 +29,7 @@ use crate::{
     vault::CredentialVault,
 };
 
-const API_ROOT: &str = "https://gmail.googleapis.com/gmail/v1/users/me/";
+const API_ROOT: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 const AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 const REVOKE_ENDPOINT: &str = "https://oauth2.googleapis.com/revoke";
@@ -420,9 +420,8 @@ impl GmailProvider {
     }
 
     async fn profile_with_access_token(&self, access_token: &str) -> ProviderResult<GmailProfile> {
-        let url = Url::parse(API_ROOT)
-            .and_then(|root| root.join("profile"))
-            .map_err(|_| ProviderError::NotConfigured)?;
+        let url =
+            Url::parse(&format!("{API_ROOT}/profile")).map_err(|_| ProviderError::NotConfigured)?;
         let response = self
             .http
             .get(url)
