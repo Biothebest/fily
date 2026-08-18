@@ -5,8 +5,13 @@
   "local": true,
   "windows": ["main"],
   "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
     "allow-bootstrap",
     "allow-list-accounts",
+    "allow-begin-account-connection",
+    "allow-account-connection-status",
+    "allow-complete-account-connection",
     "allow-list-folders",
     "allow-start-sync",
     "allow-list-messages",
@@ -18,6 +23,8 @@
     "allow-execute-plan",
     "allow-undo-action",
     "allow-list-audit",
-    "allow-disconnect-account"
+    "allow-disconnect-account",
+    "allow-legacy-migration-status",
+    "allow-migrate-legacy"
   ]
 }

@@ -40,3 +40,14 @@ keyring = { version = "3.6", features = ["apple-native", "windows-native"] }
 rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
 thiserror = "1.0"
 zeroize = { version = "1.8", features = ["derive"] }
+open = "5.3"
+rfd = { version = "0.15", default-features = false, features = ["tokio", "xdg-portal"] }
+tokio = { version = "1", features = ["fs", "io-util", "net", "time"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSAlert", "NSApplication", "NSButton", "NSControl", "NSResponder", "NSSecureTextField", "NSTextField", "NSView"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSGeometry", "NSString"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_Controls", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }

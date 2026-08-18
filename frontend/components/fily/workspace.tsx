@@ -3,10 +3,13 @@
 import { useEffect, useState } from "react"
 import { filyApi } from "@/lib/fily-api"
 import type {
+  AccountConnection,
   AgentPlan,
   AuditEvent,
   BootstrapData,
   OpaqueId,
+  LegacyMigrationStatus,
+  AccountConnectionInput,
   SanitizedMessage,
   SearchHit,
 } from "@/lib/fily-api"
@@ -40,6 +43,13 @@ export function Workspace({ data }: { data: BootstrapData }) {
   const [disconnectingId, setDisconnectingId] = useState<OpaqueId | null>(null)
   const [syncingId, setSyncingId] = useState<OpaqueId | null>(null)
   const [syncNotice, setSyncNotice] = useState<string | null>(null)
+  const [connection, setConnection] = useState<AccountConnection | null>(null)
+  const [connectionBusy, setConnectionBusy] = useState(false)
+  const [connectionError, setConnectionError] = useState<string | null>(null)
+  const [migrationStatus, setMigrationStatus] = useState<LegacyMigrationStatus | null>(null)
+  const [migrationLoading, setMigrationLoading] = useState(true)
+  const [migrating, setMigrating] = useState(false)
+  const [migrationError, setMigrationError] = useState<string | null>(null)
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([])
   const [auditCursor, setAuditCursor] = useState<string | null>(null)
   const [auditLoading, setAuditLoading] = useState(false)
@@ -77,6 +87,44 @@ export function Workspace({ data }: { data: BootstrapData }) {
       cancelled = true
     }
   }, [data.messages])
+  useEffect(() => {
+    let active = true
+    let stop: (() => void) | undefined
+    void filyApi.onSyncProgress((progress) => {
+      if (!active) return
+      const total = progress.total ? ` of ${progress.total.toLocaleString()}` : ""
+      setSyncNotice(
+        progress.statusMessage ||
+          `Secure sync: ${progress.processed.toLocaleString()}${total} changes processed.`,
+      )
+    }).then((unlisten) => {
+      if (active) stop = unlisten
+      else unlisten()
+    })
+    return () => {
+      active = false
+      stop?.()
+    }
+  }, [])
+
+  useEffect(() => {
+    let active = true
+    void filyApi
+      .getLegacyMigrationStatus()
+      .then((status) => {
+        if (active) setMigrationStatus(status)
+      })
+      .catch((error) => {
+        if (active) setMigrationError(messageFor(error, "Fily could not inspect earlier local data."))
+      })
+      .finally(() => {
+        if (active) setMigrationLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [])
+
 
   async function search() {
     const query = searchQuery.trim()
@@ -100,8 +148,8 @@ export function Workspace({ data }: { data: BootstrapData }) {
     try {
       const result = await filyApi.startAccountSync(accountId)
       const completedNotice = result.hasMore
-        ? `Indexed ${result.changed.toLocaleString()} changes. More remain; the trusted core retained its private cursor.`
-        : `Sync complete. Indexed ${result.changed.toLocaleString()} changes.`
+        ? `Indexed ${result.processed.toLocaleString()} changes in this bounded pass. More remain for the next pass.`
+        : `Sync complete. Indexed ${result.processed.toLocaleString()} changes.`
       setSyncNotice(completedNotice)
       try {
         setWorkspaceData(await filyApi.getBootstrap(50))
@@ -114,12 +162,61 @@ export function Workspace({ data }: { data: BootstrapData }) {
       setSyncingId(null)
     }
   }
+  async function refreshAfterConnection(next: AccountConnection) {
+    setConnection(next)
+    if (next.phase !== "connected") return
+    setWorkspaceData(await filyApi.getBootstrap(50))
+    if (next.account) {
+      setSyncNotice(`${next.account.email} is connected. Start its first bounded sync when ready.`)
+    }
+  }
+
+  async function beginConnection(input: AccountConnectionInput) {
+    if (connectionBusy) return
+    setConnectionBusy(true)
+    setConnectionError(null)
+    try {
+      await refreshAfterConnection(await filyApi.beginAccountConnection(input))
+    } catch (error) {
+      setConnectionError(messageFor(error, "Fily could not begin the secure account connection."))
+    } finally {
+      setConnectionBusy(false)
+    }
+  }
+
+  async function completeConnection(connectionId: OpaqueId) {
+    if (connectionBusy) return
+    setConnectionBusy(true)
+    setConnectionError(null)
+    try {
+      await refreshAfterConnection(await filyApi.completeAccountConnection(connectionId))
+    } catch (error) {
+      setConnectionError(messageFor(error, "Fily could not complete the secure account connection."))
+    } finally {
+      setConnectionBusy(false)
+    }
+  }
+
+  async function migrateLegacyData() {
+    if (migrating) return
+    setMigrating(true)
+    setMigrationError(null)
+    try {
+      setMigrationStatus(await filyApi.migrateLegacyData())
+      setWorkspaceData(await filyApi.getBootstrap(50))
+    } catch (error) {
+      setMigrationError(messageFor(error, "Fily could not securely import the earlier library."))
+    } finally {
+      setMigrating(false)
+    }
+  }
 
   async function requestDisconnect(accountId: OpaqueId) {
     if (disconnectingId) return
     setDisconnectingId(accountId)
     setPlansError(null)
     try {
+
       const plan = await filyApi.requestAccountDisconnect(accountId)
       setPlans((current) => [plan, ...current.filter((item) => item.id !== plan.id)])
       setScreen("plans")
@@ -223,6 +320,20 @@ export function Workspace({ data }: { data: BootstrapData }) {
           syncNotice={syncNotice}
           onStartSync={(id) => void startSync(id)}
           onRequestDisconnect={(id) => void requestDisconnect(id)}
+          connection={connection}
+          connectionBusy={connectionBusy}
+          connectionError={connectionError}
+          onBeginConnection={(provider) => void beginConnection(provider)}
+          onCompleteConnection={(id) => void completeConnection(id)}
+          onResetConnection={() => {
+            setConnection(null)
+            setConnectionError(null)
+          }}
+          migrationStatus={migrationStatus}
+          migrationLoading={migrationLoading}
+          migrating={migrating}
+          migrationError={migrationError}
+          onMigrateLegacy={() => void migrateLegacyData()}
         />
       ) : null}
       {screen === "plans" ? (

@@ -1,5 +1,6 @@
 use std::{
     cmp::Reverse,
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
@@ -7,9 +8,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{
     agent::{
@@ -17,11 +19,16 @@ use crate::{
         PlanApproval, PlanPreview, PlanRequest, PlanState, PreviewChange, ResourceVersion,
     },
     domain::mail::{
-        AccountId, DisconnectRequest, DraftRequest, DraftResult, FolderId,
-        Message as ProviderMessage, MessageId, MoveRequest, OperationId, ProviderKind,
-        RetrieveRequest, SyncChange, SyncRequest, Validate,
+        AccountId, ConnectRequest, ConnectedAccount, CredentialId, DisconnectRequest, DraftRequest,
+        DraftResult, EmailAddress, FolderId, ListFoldersRequest, Message as ProviderMessage,
+        MessageId, MoveRequest, OperationId, ProviderEndpoint, ProviderKind, RetrieveRequest,
+        SyncChange, SyncRequest, Validate,
     },
-    providers::{ProviderError, ProviderRegistry},
+    migration::{self, LegacyMigrationState, LegacyMigrationStatus, MigrationError},
+    native_credentials::{
+        capture_native_credential, NativeCredential, NativeCredentialError, NativeCredentialPrompt,
+    },
+    providers::{gmail_oauth::GmailOAuthOnboarding, ProviderError, ProviderRegistry},
     recovery::{RecoveryRecord as AuthorizedRecovery, RecoveryStore},
     storage::{
         AccountRecord, AuditRecord, FolderRecord, MessageBody, MessageRecord, PlanRecord,
@@ -73,6 +80,24 @@ impl From<StorageError> for CommandError {
                 "Encrypted application data is unavailable.",
             ),
             _ => Self::unavailable(),
+        }
+    }
+}
+impl From<MigrationError> for CommandError {
+    fn from(error: MigrationError) -> Self {
+        match error {
+            MigrationError::InvalidSource => {
+                Self::new("legacy_data_invalid", "Legacy Fily data could not be read.")
+            }
+            MigrationError::SourceChanged => Self::new(
+                "legacy_data_changed",
+                "Legacy Fily data changed during migration. Try again.",
+            ),
+            MigrationError::Storage(error) => error.into(),
+            MigrationError::Source(_) => Self::new(
+                "legacy_data_unavailable",
+                "Legacy Fily data is unavailable.",
+            ),
         }
     }
 }
@@ -129,8 +154,10 @@ pub struct AppState {
     storage: Storage,
     vault: CredentialVault,
     providers: Arc<ProviderRegistry>,
+    gmail_onboarding: Option<Arc<GmailOAuthOnboarding>>,
     policy: Mutex<AgentPolicy>,
     recovery: Mutex<RecoveryStore>,
+    legacy_source: Option<PathBuf>,
 }
 
 impl AppState {
@@ -139,11 +166,18 @@ impl AppState {
             .path()
             .app_data_dir()
             .map_err(|_| CommandError::unavailable())?;
+        let home_dir = app
+            .path()
+            .home_dir()
+            .map_err(|_| CommandError::unavailable())?;
         let vault =
             CredentialVault::new("com.fily.desktop").map_err(|_| CommandError::unavailable())?;
         let storage = Storage::open_with_vault(data_dir.join("fily.db"), &vault)?;
-        let providers = crate::providers::production_registry(vault.clone())?;
-        Self::from_parts(storage, vault, Arc::new(providers))
+        let production = crate::providers::production_providers(vault.clone())?;
+        let mut state = Self::from_parts(storage, vault, Arc::new(production.registry))?;
+        state.gmail_onboarding = Some(Arc::new(production.gmail_onboarding));
+        state.legacy_source = Some(migration::legacy_database_path(&home_dir));
+        Ok(state)
     }
 
     pub fn from_parts(
@@ -177,8 +211,10 @@ impl AppState {
             storage,
             vault,
             providers,
+            gmail_onboarding: None,
             policy: Mutex::new(policy),
             recovery: Mutex::new(recovery),
+            legacy_source: None,
         })
     }
 
@@ -313,6 +349,41 @@ pub struct ListMessagesRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImapPublicConfiguration {
+    pub imap_host: String,
+    pub imap_port: u16,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub username: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BeginAccountConnectionRequest {
+    pub provider: ProviderKind,
+    pub email: Option<String>,
+    pub imap_configuration: Option<ImapPublicConfiguration>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountConnectionStatusRequest {
+    pub connection_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountConnectionView {
+    pub connection_id: String,
+    pub provider: ProviderKind,
+    pub phase: &'static str,
+    pub authorization_url: Option<&'static str>,
+    pub account: Option<ConnectedAccountView>,
+    pub status_message: Option<&'static str>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StartSyncRequest {
     pub account_id: String,
 }
@@ -432,6 +503,34 @@ struct StoredPlanPayload {
 }
 
 #[tauri::command]
+pub fn legacy_migration_status(
+    state: State<'_, AppState>,
+) -> Result<LegacyMigrationStatus, CommandError> {
+    let Some(source) = state.legacy_source.as_deref() else {
+        return Ok(LegacyMigrationStatus {
+            state: LegacyMigrationState::NotFound,
+            accounts: 0,
+            messages: 0,
+            skipped: 0,
+        });
+    };
+    migration::status(&state.storage, source).map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn migrate_legacy(state: State<'_, AppState>) -> Result<LegacyMigrationStatus, CommandError> {
+    let Some(source) = state.legacy_source.as_deref() else {
+        return Ok(LegacyMigrationStatus {
+            state: LegacyMigrationState::NotFound,
+            accounts: 0,
+            messages: 0,
+            skipped: 0,
+        });
+    };
+    migration::migrate(&state.storage, source).map_err(CommandError::from)
+}
+
+#[tauri::command]
 pub fn bootstrap(
     state: State<'_, AppState>,
     request: BootstrapRequest,
@@ -440,7 +539,7 @@ pub fn bootstrap(
     let account_records = state.storage.list_accounts()?;
     let accounts = account_records
         .iter()
-        .map(account_view)
+        .map(|record| account_view(&state, record))
         .collect::<Result<Vec<_>, _>>()?;
     let mut folders = Vec::new();
     let mut messages = Vec::new();
@@ -475,8 +574,338 @@ pub fn list_accounts(
         .storage
         .list_accounts()?
         .iter()
-        .map(account_view)
+        .map(|record| account_view(&state, record))
         .collect()
+}
+#[tauri::command]
+pub async fn begin_account_connection(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: BeginAccountConnectionRequest,
+) -> Result<AccountConnectionView, CommandError> {
+    let mut connected = match request.provider {
+        ProviderKind::Gmail => {
+            if request.email.is_some() || request.imap_configuration.is_some() {
+                return Err(CommandError::invalid());
+            }
+            state
+                .gmail_onboarding
+                .as_ref()
+                .ok_or_else(|| {
+                    CommandError::new(
+                        "provider_unavailable",
+                        "This provider operation is unavailable.",
+                    )
+                })?
+                .connect()
+                .await?
+        }
+        provider => connect_password_provider(&app, &state, provider, request).await?,
+    };
+    reconcile_connected_identity(&state, &mut connected)?;
+    persist_connected_account(&state, &connected).await?;
+    connection_view(&state, &connected.account_id, connected.provider)
+}
+
+#[tauri::command]
+pub fn account_connection_status(
+    state: State<'_, AppState>,
+    request: AccountConnectionStatusRequest,
+) -> Result<AccountConnectionView, CommandError> {
+    validate_id(&request.connection_id)?;
+    let account = state.account(&request.connection_id)?;
+    let provider = provider_kind(&account.provider)?;
+    let account_id = AccountId::new(account.id).map_err(|_| CommandError::unavailable())?;
+    connection_view(&state, &account_id, provider)
+}
+
+#[tauri::command]
+pub fn complete_account_connection(
+    state: State<'_, AppState>,
+    request: AccountConnectionStatusRequest,
+) -> Result<AccountConnectionView, CommandError> {
+    validate_id(&request.connection_id)?;
+    let account = state.account(&request.connection_id)?;
+    let provider = provider_kind(&account.provider)?;
+    let account_id = AccountId::new(account.id).map_err(|_| CommandError::unavailable())?;
+    connection_view(&state, &account_id, provider)
+}
+
+async fn connect_password_provider(
+    app: &AppHandle,
+    state: &AppState,
+    provider: ProviderKind,
+    request: BeginAccountConnectionRequest,
+) -> Result<ConnectedAccount, CommandError> {
+    let address = request.email.ok_or_else(CommandError::invalid)?;
+    let identity = EmailAddress {
+        address: address.trim().to_ascii_lowercase(),
+        display_name: None,
+    };
+    identity.validate().map_err(|_| CommandError::invalid())?;
+    let (endpoint, username, host) = match provider {
+        ProviderKind::Imap => {
+            let config = request
+                .imap_configuration
+                .ok_or_else(CommandError::invalid)?;
+            let endpoint = ProviderEndpoint {
+                imap_host: config.imap_host,
+                imap_port: config.imap_port,
+                smtp_host: config.smtp_host,
+                smtp_port: config.smtp_port,
+                username: config.username,
+                use_tls: true,
+            };
+            endpoint.validate().map_err(|_| CommandError::invalid())?;
+            let username = endpoint.username.clone();
+            let host = endpoint.imap_host.clone();
+            (Some(endpoint), username, host)
+        }
+        ProviderKind::Yahoo => {
+            if request.imap_configuration.is_some() {
+                return Err(CommandError::invalid());
+            }
+            (None, identity.address.clone(), "imap.mail.yahoo.com".into())
+        }
+        ProviderKind::Icloud => {
+            if request.imap_configuration.is_some() {
+                return Err(CommandError::invalid());
+            }
+            (None, identity.address.clone(), "imap.mail.me.com".into())
+        }
+        ProviderKind::Gmail => return Err(CommandError::invalid()),
+    };
+    let account_id = existing_account_id(state, provider, &identity.address)?
+        .map(AccountId::new)
+        .transpose()
+        .map_err(|_| CommandError::unavailable())?
+        .unwrap_or(
+            AccountId::new(random_opaque_id("account")).map_err(|_| CommandError::unavailable())?,
+        );
+    let credential_id = CredentialId::new(random_opaque_id("credential"))
+        .map_err(|_| CommandError::unavailable())?;
+    let provider_name = provider_slug(provider);
+    let credential = capture_password_on_main_thread(app, provider_name, username, host)
+        .await?
+        .ok_or_else(|| {
+            CommandError::new(
+                "connection_cancelled",
+                "The secure account connection was cancelled.",
+            )
+        })?;
+    state
+        .vault
+        .set_secret(
+            credential_id.as_str(),
+            "imap-password",
+            credential.expose_secret().as_bytes(),
+        )
+        .map_err(|_| CommandError::unavailable())?;
+    if let Err(_error) = state.vault.set_secret(
+        credential_id.as_str(),
+        "smtp-password",
+        credential.expose_secret().as_bytes(),
+    ) {
+        state
+            .vault
+            .delete_secret(credential_id.as_str(), "imap-password")
+            .ok();
+        return Err(CommandError::unavailable());
+    }
+    drop(credential);
+    let connect = ConnectRequest {
+        provider,
+        account_id,
+        credential_id: credential_id.clone(),
+        identity,
+        endpoint,
+    };
+    match state.providers.connect(connect).await {
+        Ok(connected) => Ok(connected),
+        Err(error) => {
+            state
+                .vault
+                .delete_secret(credential_id.as_str(), "imap-password")
+                .ok();
+            state
+                .vault
+                .delete_secret(credential_id.as_str(), "smtp-password")
+                .ok();
+            Err(error.into())
+        }
+    }
+}
+
+async fn capture_password_on_main_thread(
+    app: &AppHandle,
+    provider: &'static str,
+    username: String,
+    host: String,
+) -> Result<Option<NativeCredential>, CommandError> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    app.run_on_main_thread(move || {
+        let captured = capture_native_credential(NativeCredentialPrompt {
+            provider,
+            username: &username,
+            host: &host,
+        });
+        sender.send(captured).ok();
+    })
+    .map_err(|_| CommandError::unavailable())?;
+    tauri::async_runtime::spawn_blocking(move || receiver.recv())
+        .await
+        .map_err(|_| CommandError::unavailable())?
+        .map_err(|_| CommandError::unavailable())?
+        .map_err(native_credential_error)
+}
+
+fn native_credential_error(error: NativeCredentialError) -> CommandError {
+    match error {
+        NativeCredentialError::UnsupportedProvider
+        | NativeCredentialError::InvalidUsername
+        | NativeCredentialError::InvalidHost
+        | NativeCredentialError::InvalidSecret => CommandError::invalid(),
+        NativeCredentialError::NotMainThread | NativeCredentialError::Unavailable => {
+            CommandError::new(
+                "native_capture_unavailable",
+                "Native secure credential capture is unavailable.",
+            )
+        }
+    }
+}
+
+fn existing_account_id(
+    state: &AppState,
+    provider: ProviderKind,
+    address: &str,
+) -> Result<Option<String>, CommandError> {
+    Ok(state
+        .storage
+        .list_accounts()?
+        .into_iter()
+        .find(|account| {
+            account
+                .provider
+                .eq_ignore_ascii_case(provider_slug(provider))
+                && account.address.eq_ignore_ascii_case(address)
+        })
+        .map(|account| account.id))
+}
+
+fn reconcile_connected_identity(
+    state: &AppState,
+    connected: &mut ConnectedAccount,
+) -> Result<(), CommandError> {
+    let Some(existing_id) =
+        existing_account_id(state, connected.provider, &connected.identity.address)?
+    else {
+        return Ok(());
+    };
+    if existing_id == connected.account_id.as_str() {
+        return Ok(());
+    }
+    if connected.provider != ProviderKind::Gmail {
+        return Err(CommandError::new(
+            "account_conflict",
+            "This provider account is already connected.",
+        ));
+    }
+    let generated_key = format!(
+        "gmail-account-{}",
+        crate::agent::sha256_hex(connected.account_id.as_str().as_bytes())
+    );
+    let existing_key = format!(
+        "gmail-account-{}",
+        crate::agent::sha256_hex(existing_id.as_bytes())
+    );
+    let session = state
+        .vault
+        .get_secret(&generated_key, "gmail-oauth-token-v1")
+        .map_err(|_| CommandError::unavailable())?
+        .ok_or_else(CommandError::unavailable)?;
+    state
+        .vault
+        .set_secret(&existing_key, "gmail-oauth-token-v1", session.as_ref())
+        .map_err(|_| CommandError::unavailable())?;
+    state
+        .vault
+        .delete_secret(&generated_key, "gmail-oauth-token-v1")
+        .map_err(|_| CommandError::unavailable())?;
+    connected.account_id = AccountId::new(existing_id).map_err(|_| CommandError::unavailable())?;
+    Ok(())
+}
+
+async fn persist_connected_account(
+    state: &AppState,
+    connected: &ConnectedAccount,
+) -> Result<(), CommandError> {
+    connected
+        .identity
+        .validate()
+        .map_err(|_| CommandError::unavailable())?;
+    let now = now_ms()? as i64;
+    state.storage.upsert_account(&AccountRecord {
+        id: connected.account_id.as_str().to_owned(),
+        provider: provider_slug(connected.provider).into(),
+        address: connected.identity.address.clone(),
+        display_name: connected.identity.display_name.clone(),
+        created_at: now,
+        updated_at: now,
+    })?;
+    let folders = state
+        .providers
+        .list_folders(
+            connected.provider,
+            ListFoldersRequest {
+                account_id: connected.account_id.clone(),
+            },
+        )
+        .await?;
+    for folder in folders {
+        state.storage.upsert_folder(&FolderRecord {
+            id: folder.id.as_str().to_owned(),
+            account_id: connected.account_id.as_str().to_owned(),
+            remote_id: folder.id.as_str().to_owned(),
+            parent_id: None,
+            name: folder.name,
+            role: Some(format!("{:?}", folder.role).to_ascii_lowercase()),
+            unread_count: folder.unread_count.unwrap_or(0).min(u32::MAX as u64) as u32,
+            total_count: folder.total_count.unwrap_or(0).min(u32::MAX as u64) as u32,
+            updated_at: now,
+        })?;
+    }
+    Ok(())
+}
+
+fn connection_view(
+    state: &AppState,
+    account_id: &AccountId,
+    provider: ProviderKind,
+) -> Result<AccountConnectionView, CommandError> {
+    let record = state.account(account_id.as_str())?;
+    Ok(AccountConnectionView {
+        connection_id: account_id.as_str().to_owned(),
+        provider,
+        phase: "connected",
+        authorization_url: None,
+        account: Some(account_view(state, &record)?),
+        status_message: Some("The account is connected and ready for its first bounded sync."),
+    })
+}
+
+fn provider_slug(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::Gmail => "gmail",
+        ProviderKind::Imap => "imap",
+        ProviderKind::Yahoo => "yahoo",
+        ProviderKind::Icloud => "icloud",
+    }
+}
+
+fn random_opaque_id(prefix: &str) -> String {
+    let mut random = [0_u8; 32];
+    OsRng.fill_bytes(&mut random);
+    format!("{prefix}:{}", crate::agent::sha256_hex(&random))
 }
 
 #[tauri::command]
@@ -600,21 +1029,36 @@ pub async fn create_draft(
     Ok(result)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncOutcome {
-    pub changed: u32,
+    pub account_id: String,
+    pub phase: &'static str,
+    pub processed: u32,
+    pub total: Option<u32>,
     pub has_more: bool,
-    pub next_cursor: Option<String>,
+    pub status_message: Option<&'static str>,
 }
 
 #[tauri::command]
 pub async fn start_sync(
     state: State<'_, AppState>,
+    app: AppHandle,
     request: StartSyncRequest,
 ) -> Result<SyncOutcome, CommandError> {
     validate_id(&request.account_id)?;
     let account = state.account(&request.account_id)?;
+    emit_sync_progress(
+        &app,
+        SyncOutcome {
+            account_id: account.id.clone(),
+            phase: "starting",
+            processed: 0,
+            total: None,
+            has_more: false,
+            status_message: Some("Starting secure provider sync."),
+        },
+    );
     let cursor = state
         .storage
         .get_sync_cursor(&account.id, "account")?
@@ -634,11 +1078,29 @@ pub async fn start_sync(
     sync_request
         .validate()
         .map_err(|_| CommandError::invalid())?;
-    let batch = state
+    let batch = match state
         .providers
         .incremental_sync(state.provider_for(&account)?, sync_request)
-        .await?;
+        .await
+    {
+        Ok(batch) => batch,
+        Err(error) => {
+            emit_sync_progress(
+                &app,
+                SyncOutcome {
+                    account_id: account.id.clone(),
+                    phase: "failed",
+                    processed: 0,
+                    total: None,
+                    has_more: false,
+                    status_message: Some("The provider sync could not be completed."),
+                },
+            );
+            return Err(error.into());
+        }
+    };
     let now = now_ms()? as i64;
+    let total = u32::try_from(batch.changes.len()).unwrap_or(MAX_PAGE_SIZE);
     let mut changed = 0_u32;
     for change in batch.changes {
         match change {
@@ -686,20 +1148,50 @@ pub async fn start_sync(
             }
         }
         changed = changed.saturating_add(1);
+        if changed % 10 == 0 || changed == total {
+            emit_sync_progress(
+                &app,
+                SyncOutcome {
+                    account_id: account.id.clone(),
+                    phase: "syncing",
+                    processed: changed,
+                    total: Some(total),
+                    has_more: batch.has_more,
+                    status_message: Some("Indexing provider changes securely."),
+                },
+            );
+        }
     }
     if let Some(cursor) = &batch.next_cursor {
         state.storage.upsert_sync_cursor(&SyncCursorRecord {
-            account_id: account.id,
+            account_id: account.id.clone(),
             scope: "account".into(),
             cursor: cursor.clone(),
             updated_at: now,
         })?;
     }
-    Ok(SyncOutcome {
-        changed,
+    let outcome = SyncOutcome {
+        account_id: account.id,
+        phase: if batch.has_more {
+            "more_available"
+        } else {
+            "complete"
+        },
+        processed: changed,
+        total: Some(total),
         has_more: batch.has_more,
-        next_cursor: batch.next_cursor,
-    })
+        status_message: Some(if batch.has_more {
+            "This bounded sync pass is complete; more changes are available."
+        } else {
+            "Secure sync is complete."
+        }),
+    };
+    emit_sync_progress(&app, outcome.clone());
+    Ok(outcome)
+}
+
+fn emit_sync_progress(app: &AppHandle, progress: SyncOutcome) {
+    let _ = app.emit_to("main", "account-sync-progress", progress);
 }
 
 #[tauri::command]
@@ -1012,21 +1504,42 @@ pub fn list_audit(
     })
 }
 
-fn account_view(record: &AccountRecord) -> Result<ConnectedAccountView, CommandError> {
-    let provider = match provider_kind(&record.provider)? {
-        ProviderKind::Gmail => "gmail",
-        ProviderKind::Imap => "imap",
-        ProviderKind::Yahoo => "yahoo",
-        ProviderKind::Icloud => "icloud",
+fn account_view(
+    state: &AppState,
+    record: &AccountRecord,
+) -> Result<ConnectedAccountView, CommandError> {
+    let kind = provider_kind(&record.provider)?;
+    let provider = provider_slug(kind);
+    let gmail_authorized = if kind == ProviderKind::Gmail {
+        let key = format!(
+            "gmail-account-{}",
+            crate::agent::sha256_hex(record.id.as_bytes())
+        );
+        state
+            .vault
+            .get_secret(&key, "gmail-oauth-token-v1")
+            .ok()
+            .flatten()
+            .is_some()
+    } else {
+        true
     };
     Ok(ConnectedAccountView {
         id: record.id.clone(),
         provider: provider.into(),
         email: record.address.clone(),
         display_name: record.display_name.clone(),
-        status: "connected",
+        status: if gmail_authorized {
+            "connected"
+        } else {
+            "attention"
+        },
         last_synced_at: None,
-        status_message: None,
+        status_message: if gmail_authorized {
+            None
+        } else {
+            Some("Connect this imported account to sync new mail.".into())
+        },
     })
 }
 

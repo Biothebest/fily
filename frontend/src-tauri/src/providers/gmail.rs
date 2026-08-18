@@ -41,32 +41,19 @@ const OAUTH_PENDING_LIFETIME_SECS: u64 = 10 * 60;
 const ACCESS_TOKEN_SKEW_SECS: u64 = 60;
 const MAX_OAUTH_FIELD_BYTES: usize = 4096;
 
-/// Public inputs needed to begin Google's authorization-code flow. The OAuth client credential is
-/// referenced by an opaque vault ID and is never accepted as a DTO.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct GmailOAuthStartInput {
-    pub request: ConnectRequest,
-    pub redirect_uri: String,
+/// Internal PKCE initiation result. The verifier remains in the OS credential vault.
+pub(super) struct GmailOAuthStart {
+    pub(super) authorization_url: String,
+    pub(super) state: String,
 }
 
-/// Safe public result of PKCE initiation. The verifier remains in the OS credential vault.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GmailOAuthStart {
-    pub authorization_url: String,
-    pub state: String,
-}
-
-/// Public authorization response. It intentionally contains neither token nor PKCE verifier.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct GmailOAuthCompletionInput {
-    pub account_id: AccountId,
-    pub credential_id: CredentialId,
-    pub redirect_uri: String,
-    pub state: String,
-    pub authorization_code: String,
+/// Internal authorization response. It intentionally cannot be serialized into a command DTO.
+pub(super) struct GmailOAuthCompletionInput {
+    pub(super) account_id: AccountId,
+    pub(super) credential_id: CredentialId,
+    pub(super) redirect_uri: String,
+    pub(super) state: String,
+    pub(super) authorization_code: String,
 }
 
 impl Drop for GmailOAuthCompletionInput {
@@ -132,7 +119,7 @@ impl GmailProvider {
 
     /// Installs a Google OAuth client credential directly into the OS vault. This is a trusted-core
     /// bootstrap API: command DTOs and React must never carry `client_secret`.
-    pub fn store_oauth_client(
+    pub(super) fn store_oauth_client(
         &self,
         credential_id: &CredentialId,
         client_id: &str,
@@ -158,24 +145,38 @@ impl GmailProvider {
             )
             .map_err(|_| ProviderError::NotConfigured)
     }
-
-    pub async fn begin_oauth(
+    pub(super) fn oauth_client_configured(
         &self,
-        input: GmailOAuthStartInput,
+        credential_id: &CredentialId,
+    ) -> ProviderResult<bool> {
+        credential_id.validate()?;
+        self.vault
+            .get_secret(
+                &credential_vault_key(credential_id.as_str()),
+                CLIENT_SECRET_KIND,
+            )
+            .map(|credential| credential.is_some())
+            .map_err(|_| ProviderError::NotConfigured)
+    }
+
+    /// Begins the installed-app flow without trusting presentation code to supply an identity.
+    /// The verified Gmail profile becomes the connected account identity after token exchange.
+    pub(super) async fn begin_oauth_for_onboarding(
+        &self,
+        account_id: &AccountId,
+        credential_id: &CredentialId,
+        redirect_uri: String,
     ) -> ProviderResult<GmailOAuthStart> {
-        input.request.validate()?;
-        if input.request.provider != ProviderKind::Gmail || input.request.endpoint.is_some() {
-            return Err(ProviderError::InvalidInput);
-        }
-        validate_redirect_uri(&input.redirect_uri)?;
-        let client = self.load_oauth_client(&input.request.credential_id)?;
+        account_id.validate()?;
+        credential_id.validate()?;
+        validate_redirect_uri(&redirect_uri)?;
+        let client = self.load_oauth_client(credential_id)?;
         let verifier = random_urlsafe(64);
         let state = random_urlsafe(32);
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let pending = PendingOAuth {
-            credential_id: input.request.credential_id.as_str().to_owned(),
-            expected_email: input.request.identity.address,
-            redirect_uri: input.redirect_uri.clone(),
+            credential_id: credential_id.as_str().to_owned(),
+            redirect_uri: redirect_uri.clone(),
             state: state.clone(),
             verifier,
             expires_at: unix_seconds().saturating_add(OAUTH_PENDING_LIFETIME_SECS),
@@ -185,7 +186,7 @@ impl GmailProvider {
         );
         self.vault
             .set_secret(
-                &account_vault_key(input.request.account_id.as_str()),
+                &account_vault_key(account_id.as_str()),
                 PENDING_SECRET_KIND,
                 serialized.as_ref(),
             )
@@ -194,7 +195,7 @@ impl GmailProvider {
         let mut url = Url::parse(AUTH_ENDPOINT).map_err(|_| ProviderError::NotConfigured)?;
         url.query_pairs_mut()
             .append_pair("client_id", &client.client_id)
-            .append_pair("redirect_uri", &input.redirect_uri)
+            .append_pair("redirect_uri", &redirect_uri)
             .append_pair("response_type", "code")
             .append_pair("scope", GMAIL_SCOPE)
             .append_pair("access_type", "offline")
@@ -209,7 +210,7 @@ impl GmailProvider {
         })
     }
 
-    pub async fn complete_oauth(
+    pub(super) async fn complete_oauth(
         &self,
         input: GmailOAuthCompletionInput,
     ) -> ProviderResult<ConnectedAccount> {
@@ -232,7 +233,6 @@ impl GmailProvider {
             || !oauth_value_valid(&pending.verifier)
             || !oauth_value_valid(&pending.redirect_uri)
             || !oauth_value_valid(&pending.credential_id)
-            || !oauth_value_valid(&pending.expected_email)
             || !constant_time_eq(pending.state.as_bytes(), input.state.as_bytes())
             || pending.redirect_uri != input.redirect_uri
             || pending.credential_id != input.credential_id.as_str()
@@ -281,14 +281,6 @@ impl GmailProvider {
                 return Err(error);
             }
         };
-        if !pending
-            .expected_email
-            .eq_ignore_ascii_case(&profile.email_address)
-        {
-            self.revoke_token(&session.refresh_token).await.ok();
-            self.vault.delete_secret(&key, PENDING_SECRET_KIND).ok();
-            return Err(ProviderError::Authentication);
-        }
         let serialized = Zeroizing::new(
             serde_json::to_vec(&session).map_err(|_| ProviderError::ProviderFailure)?,
         );
@@ -312,6 +304,14 @@ impl GmailProvider {
                 display_name: None,
             },
         })
+    }
+    /// Removes an incomplete PKCE transaction without touching any connected-account token.
+    /// This is restricted to the trusted provider layer for cancellation and timeout cleanup.
+    pub(super) fn discard_pending_oauth(&self, account_id: &AccountId) -> ProviderResult<()> {
+        account_id.validate()?;
+        self.vault
+            .delete_secret(&account_vault_key(account_id.as_str()), PENDING_SECRET_KIND)
+            .map_err(|_| ProviderError::NotConfigured)
     }
 
     fn load_oauth_client(
@@ -986,7 +986,6 @@ struct OAuthClientCredential {
 #[serde(deny_unknown_fields)]
 struct PendingOAuth {
     credential_id: String,
-    expected_email: String,
     redirect_uri: String,
     state: String,
     verifier: String,

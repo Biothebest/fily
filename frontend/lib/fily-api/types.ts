@@ -3,7 +3,38 @@ export type OpaqueId = string
 export type ProviderKind = "gmail" | "imap" | "yahoo" | "icloud"
 export type AccountStatus = "connected" | "syncing" | "attention" | "offline"
 export type PlanRisk = "low" | "medium" | "high"
+export type AccountConnectionPhase =
+  | "awaiting_authorization"
+  | "capturing_credentials"
+  | "connecting"
+  | "connected"
+  | "cancelled"
+  | "failed"
+export type SyncPhase = "starting" | "syncing" | "complete" | "more_available" | "failed"
+export interface ImapPublicConfiguration {
+  imapHost: string
+  imapPort: number
+  smtpHost: string
+  smtpPort: number
+  username: string
+}
+
+export interface AccountConnectionInput {
+  provider: ProviderKind
+  email?: string
+  imapConfiguration?: ImapPublicConfiguration
+}
+
 export type PlanStatus = "pending" | "approved" | "rejected" | "executed" | "expired" | "failed"
+export type LegacyMigrationState = "notFound" | "ready" | "completed"
+
+export interface LegacyMigrationStatus {
+  state: LegacyMigrationState
+  accounts: number
+  messages: number
+  skipped: number
+}
+
 
 export interface MailboxFolder {
   id: OpaqueId
@@ -21,6 +52,19 @@ export interface ConnectedAccount {
   lastSyncedAt?: string | null
   statusMessage?: string | null
 }
+/**
+ * Public state for a Rust-owned connection flow. The identifier is opaque and
+ * authorizationUrl is informational; authorization is opened by the Rust core.
+ */
+export interface AccountConnection {
+  connectionId: OpaqueId
+  provider: ProviderKind
+  phase: AccountConnectionPhase
+  authorizationUrl?: string | null
+  account?: ConnectedAccount | null
+  statusMessage?: string | null
+}
+
 
 export interface MailAddress {
   name?: string | null
@@ -115,9 +159,15 @@ export interface AuditEvent {
 }
 
 export interface SyncResult {
-  changed: number
+  accountId: OpaqueId
+  phase: SyncPhase
+  processed: number
+  total?: number | null
   hasMore: boolean
-  nextCursor?: string | null
+}
+
+export interface SyncProgress extends SyncResult {
+  statusMessage?: string | null
 }
 
 export interface AuditPage {
@@ -130,8 +180,14 @@ export interface FilyApi {
   getMessage(messageId: OpaqueId): Promise<SanitizedMessage>
   searchMessages(query: string, limit?: number): Promise<SearchHit[]>
   getAccounts(): Promise<ConnectedAccount[]>
+  beginAccountConnection(input: AccountConnectionInput): Promise<AccountConnection>
+  getAccountConnectionStatus(connectionId: OpaqueId): Promise<AccountConnection>
+  completeAccountConnection(connectionId: OpaqueId): Promise<AccountConnection>
   startAccountSync(accountId: OpaqueId): Promise<SyncResult>
+  onSyncProgress(listener: (progress: SyncProgress) => void): Promise<() => void>
   requestAccountDisconnect(accountId: OpaqueId): Promise<AgentPlan>
+  getLegacyMigrationStatus(): Promise<LegacyMigrationStatus>
+  migrateLegacyData(): Promise<LegacyMigrationStatus>
   getAgentPlans(): Promise<AgentPlan[]>
   approveAgentPlan(planId: OpaqueId, confirmation: string): Promise<AgentPlan>
   executeAgentPlan(planId: OpaqueId): Promise<PlanExecution>

@@ -1,6 +1,9 @@
 const COMMANDS: &[&str] = &[
     "bootstrap",
     "list_accounts",
+    "begin_account_connection",
+    "account_connection_status",
+    "complete_account_connection",
     "list_folders",
     "start_sync",
     "list_messages",
@@ -13,6 +16,8 @@ const COMMANDS: &[&str] = &[
     "undo_action",
     "list_audit",
     "disconnect_account",
+    "legacy_migration_status",
+    "migrate_legacy",
 ];
 
 fn main() {

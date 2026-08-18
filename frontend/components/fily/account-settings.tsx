@@ -1,7 +1,9 @@
 "use client"
 
 import { RefreshCw, ShieldCheck, Unplug } from "lucide-react"
-import type { ConnectedAccount, OpaqueId } from "@/lib/fily-api"
+import type { AccountConnection, AccountConnectionInput, ConnectedAccount, LegacyMigrationStatus, OpaqueId } from "@/lib/fily-api"
+import { AccountOnboarding } from "./account-onboarding"
+import { LegacyMigrationSettings } from "./legacy-migration-settings"
 
 const STATUS_LABELS: Record<ConnectedAccount["status"], string> = {
   connected: "Connected",
@@ -17,6 +19,17 @@ export function AccountSettings({
   syncNotice,
   onStartSync,
   onRequestDisconnect,
+  connection,
+  connectionBusy,
+  connectionError,
+  onBeginConnection,
+  onCompleteConnection,
+  onResetConnection,
+  migrationStatus,
+  migrationLoading,
+  migrating,
+  migrationError,
+  onMigrateLegacy,
 }: {
   accounts: ConnectedAccount[]
   syncingId: OpaqueId | null
@@ -24,6 +37,17 @@ export function AccountSettings({
   syncNotice: string | null
   onStartSync: (id: OpaqueId) => void
   onRequestDisconnect: (id: OpaqueId) => void
+  connection: AccountConnection | null
+  connectionBusy: boolean
+  connectionError: string | null
+  onBeginConnection: (input: AccountConnectionInput) => void
+  onCompleteConnection: (connectionId: OpaqueId) => void
+  onResetConnection: () => void
+  migrationStatus: LegacyMigrationStatus | null
+  migrationLoading: boolean
+  migrating: boolean
+  migrationError: string | null
+  onMigrateLegacy: () => void
 }) {
   return (
     <section className="h-full flex-1 overflow-y-auto" aria-labelledby="accounts-heading">
@@ -48,6 +72,23 @@ export function AccountSettings({
             {syncNotice}
           </p>
         ) : null}
+        <AccountOnboarding
+          connection={connection}
+          busy={connectionBusy}
+          error={connectionError}
+          onBegin={onBeginConnection}
+          onComplete={onCompleteConnection}
+          onReset={onResetConnection}
+        />
+        <LegacyMigrationSettings
+          status={migrationStatus}
+          loading={migrationLoading}
+          migrating={migrating}
+          error={migrationError}
+          onMigrate={onMigrateLegacy}
+        />
+
+
 
 
         <div className="mt-6 space-y-3">

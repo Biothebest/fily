@@ -2,6 +2,8 @@ pub mod agent;
 pub mod audit;
 pub mod commands;
 pub mod domain;
+pub mod migration;
+mod native_credentials;
 pub mod providers;
 pub mod recovery;
 pub mod storage;
@@ -29,6 +31,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
             commands::list_accounts,
+            commands::begin_account_connection,
+            commands::account_connection_status,
+            commands::complete_account_connection,
             commands::list_folders,
             commands::start_sync,
             commands::list_messages,
@@ -41,6 +46,8 @@ pub fn run() {
             commands::undo_action,
             commands::list_audit,
             commands::disconnect_account,
+            commands::legacy_migration_status,
+            commands::migrate_legacy,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Fily desktop application");

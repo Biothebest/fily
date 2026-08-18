@@ -1,4 +1,5 @@
 pub mod gmail;
+pub mod gmail_oauth;
 pub mod icloud;
 pub mod imap;
 pub mod yahoo;
@@ -235,19 +236,31 @@ impl ProviderRegistry {
     }
 }
 
-/// Builds the fixed production registry. Authorization is consumed by the command boundary before
+/// The fixed production provider set. Gmail onboarding retains the same concrete provider used by
+/// the trait-object registry so its newly vaulted session is immediately available to sync.
+pub struct ProductionProviders {
+    pub registry: ProviderRegistry,
+    pub gmail_onboarding: gmail_oauth::GmailOAuthOnboarding,
+}
+
+/// Builds the fixed production providers. Authorization is consumed by the command boundary before
 /// any registry write method is called; this private bridge prevents Gmail from introducing a
 /// second, provider-specific authorization convention that the IMAP adapters would not share.
-pub fn production_registry(vault: CredentialVault) -> ProviderResult<ProviderRegistry> {
+pub fn production_providers(vault: CredentialVault) -> ProviderResult<ProductionProviders> {
     let vault = Arc::new(vault);
     let gmail = Arc::new(gmail::GmailProvider::new(
         vault.clone(),
         Arc::new(CommandBoundaryAuthorization),
     )?);
+    let gmail_onboarding = gmail_oauth::GmailOAuthOnboarding::new(gmail.clone());
     let imap = Arc::new(imap::GenericImapProvider::new(vault.clone()));
     let yahoo = Arc::new(yahoo::YahooProvider::new(vault.clone()));
     let icloud = Arc::new(icloud::ICloudProvider::new(vault));
-    ProviderRegistry::new(gmail, imap, yahoo, icloud)
+    let registry = ProviderRegistry::new(gmail, imap, yahoo, icloud)?;
+    Ok(ProductionProviders {
+        registry,
+        gmail_onboarding,
+    })
 }
 
 #[derive(Debug)]

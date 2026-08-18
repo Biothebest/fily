@@ -19,7 +19,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::vault::{CredentialVault, VaultError};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const NONCE_LEN: usize = 24;
 const MAX_ID_LEN: usize = 192;
 const MAX_SHORT_TEXT: usize = 512;
@@ -152,6 +152,15 @@ pub struct RecoveryRecord {
     pub state: Value,
     pub created_at: i64,
     pub updated_at: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MigrationCheckpointRecord {
+    pub name: String,
+    pub source_hash: String,
+    pub accounts: u32,
+    pub messages: u32,
+    pub skipped: u32,
+    pub completed_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -372,6 +381,22 @@ impl Storage {
                 Ok(record)
             })
             .transpose()
+    }
+    pub fn find_message_id_by_remote_id(
+        &self,
+        account_id: &str,
+        remote_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        validate_id(account_id, "account id")?;
+        validate_id(remote_id, "remote message id")?;
+        self.lock()?
+            .query_row(
+                "SELECT id FROM messages WHERE account_id=?1 AND remote_id=?2",
+                params![account_id, remote_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StorageError::from)
     }
 
     pub fn list_messages(
@@ -763,6 +788,56 @@ impl Storage {
             == 1)
     }
 
+    pub fn get_migration_checkpoint(
+        &self,
+        name: &str,
+    ) -> Result<Option<MigrationCheckpointRecord>, StorageError> {
+        validate_id(name, "migration name")?;
+        self.lock()?
+            .query_row(
+                "SELECT name,source_hash,accounts,messages,skipped,completed_at
+                 FROM migration_checkpoints WHERE name=?1",
+                [name],
+                |row| {
+                    Ok(MigrationCheckpointRecord {
+                        name: row.get(0)?,
+                        source_hash: row.get(1)?,
+                        accounts: row.get(2)?,
+                        messages: row.get(3)?,
+                        skipped: row.get(4)?,
+                        completed_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
+    pub fn upsert_migration_checkpoint(
+        &self,
+        record: &MigrationCheckpointRecord,
+    ) -> Result<(), StorageError> {
+        validate_id(&record.name, "migration name")?;
+        validate_text(&record.source_hash, MAX_SHORT_TEXT, "migration source hash")?;
+        self.lock()?.execute(
+            "INSERT INTO migration_checkpoints
+               (name,source_hash,accounts,messages,skipped,completed_at)
+             VALUES (?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(name) DO UPDATE SET source_hash=excluded.source_hash,
+               accounts=excluded.accounts,messages=excluded.messages,
+               skipped=excluded.skipped,completed_at=excluded.completed_at",
+            params![
+                record.name,
+                record.source_hash,
+                record.accounts,
+                record.messages,
+                record.skipped,
+                record.completed_at
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn checkpoint(&self) -> Result<(), StorageError> {
         self.lock()?
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
@@ -862,6 +937,10 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StorageError> {
     }
     if version == 0 {
         create_schema(&transaction)?;
+    } else if version < 2 {
+        create_migration_checkpoint_schema(&transaction)?;
+    }
+    if version < SCHEMA_VERSION {
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     transaction.commit()?;
@@ -928,6 +1007,17 @@ fn create_schema(transaction: &Transaction<'_>) -> Result<(), StorageError> {
          CREATE TRIGGER messages_search_delete AFTER DELETE ON messages BEGIN
            DELETE FROM message_search WHERE message_id=old.id;
          END;",
+    )?;
+    create_migration_checkpoint_schema(transaction)?;
+    Ok(())
+}
+
+fn create_migration_checkpoint_schema(transaction: &Transaction<'_>) -> Result<(), StorageError> {
+    transaction.execute_batch(
+        "CREATE TABLE migration_checkpoints (
+           name TEXT PRIMARY KEY, source_hash TEXT NOT NULL,
+           accounts INTEGER NOT NULL, messages INTEGER NOT NULL, skipped INTEGER NOT NULL,
+           completed_at INTEGER NOT NULL);",
     )?;
     Ok(())
 }
