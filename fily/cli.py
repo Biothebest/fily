@@ -18,6 +18,7 @@ from .ingest import ingest_path
 from .store import Store
 from .gmail import GmailClient
 from .gmail_sync import sync_gmail
+from .server import serve
 
 DEFAULT_LIBRARY = Path("~/FilyLibrary")
 DEFAULT_GMAIL_ACCOUNT = "matthew.benitez23@gmail.com"
@@ -322,6 +323,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-browser", action="store_true", help="do not open a browser during first authorization")
     p.add_argument("--json", action="store_true", dest="as_json")
 
+    p = sub.add_parser("serve", help="run the local desktop API")
+    p.add_argument("library", nargs="?", help="library directory (default: ~/FilyLibrary)")
+    p.add_argument("--host", default="127.0.0.1", help="loopback host (default: 127.0.0.1)")
+    p.add_argument("--port", type=int, default=8765, help="local API port (default: 8765)")
+
     for name in ("approve", "reject", "execute"):
         p = sub.add_parser(name, help="{} an archive action".format(name))
         p.add_argument("items", nargs="+", metavar="ID")
@@ -333,6 +339,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         command = args.command
+        if command == "serve":
+            store = Store(_library(args.library))
+            serve(store, host=args.host, port=args.port)
+            return 0
+
         if command == "gmail-auth":
             client = GmailClient(args.client_secret, args.token_path, args.account)
             token = client.authorize(open_browser=not args.no_browser)
