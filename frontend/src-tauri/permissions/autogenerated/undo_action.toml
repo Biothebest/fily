@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-undo-action"
+description = "Enables the undo_action command without any pre-configured scope."
+commands.allow = ["undo_action"]
+
+[[permission]]
+identifier = "deny-undo-action"
+description = "Denies the undo_action command without any pre-configured scope."
+commands.deny = ["undo_action"]

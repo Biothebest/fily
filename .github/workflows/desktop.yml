@@ -5,10 +5,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "desktop/**"
-      - "fily/**"
       - "frontend/**"
-      - "pyproject.toml"
       - ".github/workflows/desktop.yml"
 
 permissions:
@@ -21,16 +18,18 @@ jobs:
       matrix:
         include:
           - os: macos-14
-            artifact: fily-macos-arm64
+            artifact: fily-macos
+            bundles: dmg,app
           - os: windows-2025
             artifact: fily-windows-x64
+            bundles: msi,nsis
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: frontend/src-tauri
       - uses: pnpm/action-setup@v4
         with:
           version: 11.22.0
@@ -42,13 +41,9 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: pnpm install --frozen-lockfile
-      - name: Install backend builder
-        run: python -m pip install "pyinstaller>=6,<7"
-      - name: Build backend sidecar
-        run: python desktop/build_sidecar.py
       - name: Build desktop installer
         working-directory: frontend
-        run: pnpm tauri build
+        run: pnpm tauri build --bundles "${{ matrix.bundles }}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}

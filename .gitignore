@@ -7,5 +7,3 @@ venv/
 .fily/
 *.sqlite3
 .env
-.desktop-build/
-frontend/src-tauri/binaries/

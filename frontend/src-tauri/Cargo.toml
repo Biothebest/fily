@@ -5,6 +5,7 @@ description = "Private, approval-first email and file workspace"
 authors = ["Fily"]
 license = "Proprietary"
 repository = "https://github.com/Biothebest/fily"
+homepage = "https://github.com/Biothebest/fily"
 edition = "2021"
 rust-version = "1.77.2"
 
@@ -23,4 +24,19 @@ serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
-tauri-plugin-shell = "2"
+async-trait = "0.1"
+imap = { version = "2.4", default-features = false, features = ["tls"] }
+lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "native-tls", "smtp-transport"] }
+mailparse = "0.15"
+native-tls = "0.2"
+ammonia = "4"
+base64 = "0.22"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sha2 = "0.10"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+keyring = { version = "3.6", features = ["apple-native", "windows-native"] }
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
+thiserror = "1.0"
+zeroize = { version = "1.8", features = ["derive"] }

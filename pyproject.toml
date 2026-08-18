@@ -8,9 +8,6 @@ version = "0.1.0"
 description = "An explainable, approval-first agentic filing system"
 requires-python = ">=3.9"
 
-[project.optional-dependencies]
-desktop = ["pyinstaller>=6.0,<7"]
-
 [project.scripts]
 fily = "fily.cli:main"
 

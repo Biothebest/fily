@@ -1,18 +1,19 @@
 {
-  "name": "my-project",
+  "name": "fily-desktop",
   "version": "0.1.0",
   "private": true,
+  "description": "Private, approval-first email and file workspace",
+  "packageManager": "pnpm@11.22.0",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start",
     "lint": "eslint .",
-    "desktop:sidecar": "python3 ../desktop/build_sidecar.py",
-    "desktop:dev": "pnpm desktop:sidecar && tauri dev",
-    "desktop:build": "pnpm desktop:sidecar && tauri build"
+    "desktop:dev": "tauri dev",
+    "desktop:build": "tauri build"
   },
   "dependencies": {
     "@base-ui/react": "^1.5.0",
+    "@tauri-apps/api": "^2.11.1",
     "@vercel/analytics": "1.6.1",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",

@@ -1,14 +1,17 @@
-use std::{fs, sync::Mutex};
+pub mod agent;
+pub mod audit;
+pub mod commands;
+pub mod domain;
+pub mod providers;
+pub mod recovery;
+pub mod storage;
+pub mod vault;
 
-use tauri::{Manager, RunEvent};
-use tauri_plugin_shell::{process::CommandChild, ShellExt};
-
-struct BackendProcess(Mutex<Option<CommandChild>>);
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let application = tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
+    tauri::Builder::default()
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -18,38 +21,27 @@ pub fn run() {
                 )?;
             }
 
-            let library = app.path().home_dir()?.join("FilyLibrary");
-            fs::create_dir_all(&library)?;
-            let library = library
-                .to_str()
-                .ok_or("Fily data directory is not valid UTF-8")?;
-            let arguments = vec![
-                "serve".to_owned(),
-                library.to_owned(),
-                "--host".to_owned(),
-                "127.0.0.1".to_owned(),
-                "--port".to_owned(),
-                "8765".to_owned(),
-                "--parent-pid".to_owned(),
-                std::process::id().to_string(),
-            ];
-            let sidecar = app.shell().sidecar("fily-backend")?.args(arguments);
-            let (_events, child) = sidecar.spawn()?;
-            app.manage(BackendProcess(Mutex::new(Some(child))));
+            let state = commands::AppState::initialize(app.handle())
+                .map_err(|error| format!("trusted core initialization failed: {}", error.code))?;
+            app.manage(state);
             Ok(())
         })
-        .build(tauri::generate_context!())
-        .expect("failed to build Fily desktop application");
-
-    application.run(|handle, event| {
-        if matches!(event, RunEvent::Exit | RunEvent::ExitRequested { .. }) {
-            if let Some(process) = handle.try_state::<BackendProcess>() {
-                if let Ok(mut child) = process.0.lock() {
-                    if let Some(child) = child.take() {
-                        let _ = child.kill();
-                    }
-                }
-            }
-        }
-    });
+        .invoke_handler(tauri::generate_handler![
+            commands::bootstrap,
+            commands::list_accounts,
+            commands::list_folders,
+            commands::start_sync,
+            commands::list_messages,
+            commands::get_message,
+            commands::search_messages,
+            commands::create_draft,
+            commands::list_plans,
+            commands::approve_plan,
+            commands::execute_plan,
+            commands::undo_action,
+            commands::list_audit,
+            commands::disconnect_account,
+        ])
+        .run(tauri::generate_context!())
+        .expect("failed to run Fily desktop application");
 }

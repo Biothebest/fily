@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-  fily_desktop_lib::run();
+    fily_desktop_lib::run();
 }

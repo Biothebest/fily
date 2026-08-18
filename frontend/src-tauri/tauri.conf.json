@@ -22,18 +22,18 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:8765 ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "Fily",
+    "homepage": "https://github.com/Biothebest/fily",
+    "copyright": "Copyright © 2026 Fily",
     "category": "Productivity",
     "shortDescription": "Private, approval-first email and file workspace",
     "longDescription": "Fily organizes and retrieves indexed email and files through a private local desktop application.",
-    "externalBin": [
-      "binaries/fily-backend"
-    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -41,8 +41,26 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "android": {
-      "debugApplicationIdSuffix": ".debug"
+    "macOS": {
+      "minimumSystemVersion": "12.0",
+      "hardenedRuntime": true
+    },
+    "windows": {
+      "allowDowngrades": false,
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "wix": {
+        "upgradeCode": "fae9093b-9fa3-4870-8132-4be8b11f6529",
+        "language": "en-US"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": [
+          "English"
+        ]
+      }
     }
   }
 }
