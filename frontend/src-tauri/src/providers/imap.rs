@@ -21,6 +21,7 @@ use native_tls::{Protocol, TlsConnector, TlsStream};
 use zeroize::Zeroizing;
 
 use crate::{
+    agent::sha256_hex,
     domain::mail::{
         AccountId, Attachment, AttachmentId, ConnectRequest, ConnectedAccount, DeleteDraftRequest,
         DisconnectRequest, DraftId, DraftRequest, DraftResult, EmailAddress, Folder, FolderId,
@@ -596,31 +597,55 @@ impl GenericImapProvider {
             .send_raw(&envelope, &outbound)
             .map_err(|_| ProviderError::Network)?;
 
-        let sent = self.resolve_role_folder(account, FolderRole::Sent)?;
-        session
-            .append_with_flags(&sent, &outbound, &[Flag::Seen])
-            .map_err(|_| ProviderError::Network)?;
-        session
-            .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
-            .map_err(|_| ProviderError::Network)?;
-        let _ = session.uid_expunge(uid.to_string());
+        let sent_at_ms = now_ms();
         let message_header = parsed.headers.get_first_value("Message-ID");
         drop(parsed);
-        session.select(&sent).map_err(|_| ProviderError::NotFound)?;
-        let sent_uid = if let Some(header) = message_header {
+        let accepted_id = smtp_accepted_message_id(
+            message_header
+                .as_deref()
+                .unwrap_or(request.draft_id.as_str()),
+        )?;
+
+        // SMTP acceptance is the irreversible boundary. Everything below is best-effort
+        // reconciliation: returning an error would leave a resendable local draft even though
+        // the recipient's server may already have accepted the message.
+        let Ok(sent) = self.resolve_role_folder(account, FolderRole::Sent) else {
+            let _ = session.uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)");
+            let _ = session.uid_expunge(uid.to_string());
+            let _ = session.logout();
+            return Ok(SendResult {
+                message_id: accepted_id,
+                sent_at_ms,
+            });
+        };
+        if session
+            .append_with_flags(&sent, &outbound, &[Flag::Seen])
+            .is_err()
+        {
+            let _ = session.uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)");
+            let _ = session.uid_expunge(uid.to_string());
+            let _ = session.logout();
+            return Ok(SendResult {
+                message_id: accepted_id,
+                sent_at_ms,
+            });
+        }
+        let _ = session.uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)");
+        let _ = session.uid_expunge(uid.to_string());
+        let sent_uid = message_header.and_then(|header| {
+            session.select(&sent).ok()?;
             session
                 .uid_search(format!("HEADER Message-ID {}", quote_imap(&header)))
-                .map_err(|_| ProviderError::Network)?
+                .ok()?
                 .into_iter()
                 .max()
-                .ok_or(ProviderError::Conflict)?
-        } else {
-            return Err(ProviderError::Conflict);
-        };
+        });
         let _ = session.logout();
         Ok(SendResult {
-            message_id: message_id(&sent, sent_uid)?,
-            sent_at_ms: now_ms(),
+            message_id: sent_uid
+                .and_then(|uid| message_id(&sent, uid).ok())
+                .unwrap_or(accepted_id),
+            sent_at_ms,
         })
     }
 
@@ -1452,6 +1477,10 @@ fn strip_bcc_headers(raw: &[u8]) -> ProviderResult<Vec<u8>> {
     output.extend_from_slice(b"\r\n");
     output.extend_from_slice(&raw[boundary + 4..]);
     Ok(output)
+}
+
+fn smtp_accepted_message_id(seed: &str) -> ProviderResult<MessageId> {
+    MessageId::new(format!("imap-accepted:{}", sha256_hex(seed.as_bytes()))).map_err(Into::into)
 }
 
 fn new_rfc_message_id() -> String {

@@ -1,14 +1,15 @@
 "use client"
 
-import { Bot, History, Inbox, Search, Settings } from "lucide-react"
+import { Bot, History, Inbox, Search, Settings, Sparkles } from "lucide-react"
 import { cn } from "@/lib/utils"
 import type { ConnectedAccount } from "@/lib/fily-api"
 
-export type WorkspaceScreen = "inbox" | "search" | "plans" | "audit" | "settings"
+export type WorkspaceScreen = "inbox" | "search" | "agent" | "plans" | "audit" | "settings"
 
 const NAVIGATION: Array<{ id: WorkspaceScreen; label: string; icon: typeof Inbox }> = [
   { id: "inbox", label: "Inbox", icon: Inbox },
   { id: "search", label: "Search", icon: Search },
+  { id: "agent", label: "Ask & review", icon: Sparkles },
   { id: "plans", label: "Agent plans", icon: Bot },
   { id: "audit", label: "Audit history", icon: History },
 ]

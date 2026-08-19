@@ -4,6 +4,7 @@ import { RefreshCw, ShieldCheck, Unplug } from "lucide-react"
 import type { AccountConnection, AccountConnectionInput, ConnectedAccount, LegacyMigrationStatus, OpaqueId } from "@/lib/fily-api"
 import { AccountOnboarding } from "./account-onboarding"
 import { LegacyMigrationSettings } from "./legacy-migration-settings"
+import { LocalLibrarySettings } from "./local-library-settings"
 
 const STATUS_LABELS: Record<ConnectedAccount["status"], string> = {
   connected: "Connected",
@@ -87,6 +88,7 @@ export function AccountSettings({
           error={migrationError}
           onMigrate={onMigrateLegacy}
         />
+        <LocalLibrarySettings />
 
 
 

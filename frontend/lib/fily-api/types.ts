@@ -213,6 +213,109 @@ export interface AuditPage {
   nextCursor?: string | null
 }
 
+export interface FolderGrant {
+  id: OpaqueId
+  canonicalPath: string
+  createdAt: number
+  updatedAt: number
+}
+
+export interface LocalFileRecord {
+  id: OpaqueId
+  rootId: OpaqueId
+  relativePath: string
+  title: string
+  mediaType: string
+  sizeBytes: number
+  modifiedAt: number
+  contentHash: string
+  duplicateGroup?: string | null
+  versionGroup: string
+  extractionStatus: string
+  excerpt: string
+  indexedAt: number
+}
+
+export type ReviewQueueKind = "needs_decision" | "suggested_action" | "duplicate" | "case"
+export type ReviewItemStatus = "suggested" | "approved" | "rejected" | "executed" | "undone" | "failed"
+export type RuleStatus = "active" | "paused" | "error"
+export type ApprovalMode = "always_ask" | "ask_below_confidence" | "auto_reversible"
+
+export interface Citation {
+  sourceKind: "email" | "file" | "case" | "report"
+  recordId: OpaqueId
+  title: string
+  excerpt: string
+}
+
+export interface AgentAnswer {
+  answer: string
+  citations: Citation[]
+  confidence: number
+  plan?: AgentPlan | null
+}
+
+export interface ReviewRecord {
+  id: OpaqueId
+  queue: ReviewQueueKind
+  title: string
+  reason: string
+  status: ReviewItemStatus
+  confidence: number
+  affectedRecords: Citation[]
+  reversible: boolean
+  createdAt: string
+}
+
+export interface LearnedRule {
+  id: OpaqueId
+  name: string
+  conditions: string[]
+  actions: string[]
+  reason: string
+  status: RuleStatus
+  errorCount: number
+  confidenceThreshold: number
+  approvalMode: ApprovalMode
+  schedule: "manual" | "hourly" | "daily"
+  updatedAt: string
+}
+
+export interface RuleInput {
+  name: string
+  conditions: string[]
+  actions: string[]
+  reason: string
+  confidenceThreshold: number
+  approvalMode: ApprovalMode
+  schedule: "manual" | "hourly" | "daily"
+}
+
+export interface RuleChangePreview {
+  rule: LearnedRule
+  operation: "create" | "update" | "delete"
+  summary: string
+  affectedCount: number
+  requiredConfirmation: string
+}
+
+export interface ArchiveCase {
+  id: OpaqueId
+  kind: "employee" | "vendor" | "case"
+  title: string
+  summary: string
+  recordCount: number
+  citations: Citation[]
+  updatedAt: string
+}
+
+export interface DailyReport {
+  generatedAt: string
+  anomalies: ReviewRecord[]
+  duplicates: ReviewRecord[]
+  deadlines: ReviewRecord[]
+}
+
 export interface FilyApi {
   getBootstrap(messageLimit: number): Promise<BootstrapData>
   listFolders(accountId: OpaqueId): Promise<MailboxFolder[]>
@@ -239,4 +342,17 @@ export interface FilyApi {
   createReplyDraft(accountId: OpaqueId, messageId: OpaqueId): Promise<DraftView>
   createSendPreview(accountId: OpaqueId, draftId: OpaqueId): Promise<AgentPlan>
   executeSend(planId: OpaqueId): Promise<SendExecution>
+  askAgent(question: string): Promise<AgentAnswer>
+  listReviewQueue(queue?: ReviewQueueKind): Promise<ReviewRecord[]>
+  decideReviewItem(id: OpaqueId, decision: "approve" | "reject"): Promise<ReviewRecord>
+  undoReviewItem(id: OpaqueId): Promise<ReviewRecord>
+  listRules(): Promise<LearnedRule[]>
+  previewRuleChange(input: RuleInput, ruleId?: OpaqueId, deleting?: boolean): Promise<RuleChangePreview>
+  confirmRuleChange(preview: RuleChangePreview, confirmation: string): Promise<LearnedRule>
+  listArchives(): Promise<ArchiveCase[]>
+  getDailyReport(): Promise<DailyReport>
+  pickFolderGrant(): Promise<FolderGrant | null>
+  listFolderGrants(): Promise<FolderGrant[]>
+  rescanFolderGrant(rootId: OpaqueId): Promise<LocalFileRecord[]>
+  revokeFolderGrant(rootId: OpaqueId): Promise<boolean>
 }

@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use crate::domain::mail::{
     ConnectRequest, ConnectedAccount, DeleteDraftRequest, DisconnectRequest, DraftRequest,
     DraftResult, Folder, ListFoldersRequest, Message, MoveRequest, MutationRequest, MutationResult,
-    ProviderKind, RetrieveRequest, SearchRequest, SearchResults, SendRequest, SendResult, SyncBatch,
-    SyncRequest, Validate, ValidationError,
+    ProviderKind, RetrieveRequest, SearchRequest, SearchResults, SendRequest, SendResult,
+    SyncBatch, SyncRequest, Validate, ValidationError,
 };
 use crate::vault::CredentialVault;
 

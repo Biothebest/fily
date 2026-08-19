@@ -1,0 +1,44 @@
+[[permission]]
+identifier = "allow-ask-agent"
+description = "Allows citation-grounded local agent questions and review-only proposals."
+commands.allow = ["ask_agent"]
+
+[[permission]]
+identifier = "allow-list-review-queue"
+description = "Allows reading bounded local review queues."
+commands.allow = ["list_review_queue"]
+
+[[permission]]
+identifier = "allow-decide-review-item"
+description = "Allows approving or rejecting a review suggestion without directly executing it."
+commands.allow = ["decide_review_item"]
+
+[[permission]]
+identifier = "allow-undo-review-item"
+description = "Allows undoing a reversible executed review item."
+commands.allow = ["undo_review_item"]
+
+[[permission]]
+identifier = "allow-list-rules"
+description = "Allows listing bounded local filing rules."
+commands.allow = ["list_rules"]
+
+[[permission]]
+identifier = "allow-preview-rule-change"
+description = "Allows previewing a filing rule change."
+commands.allow = ["preview_rule_change"]
+
+[[permission]]
+identifier = "allow-confirm-rule-change"
+description = "Allows explicitly confirming a previewed filing rule change."
+commands.allow = ["confirm_rule_change"]
+
+[[permission]]
+identifier = "allow-list-archives"
+description = "Allows listing locally assembled employee, vendor, and case archives."
+commands.allow = ["list_archives"]
+
+[[permission]]
+identifier = "allow-get-daily-report"
+description = "Allows reading the bounded daily local anomaly report."
+commands.allow = ["get_daily_report"]

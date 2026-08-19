@@ -18,6 +18,12 @@ use crate::{
         ActionPlan, AgentError, AgentPolicy, ExecutionRequest, PermissionLevel, PlanAction,
         PlanApproval, PlanPreview, PlanRequest, PlanState, PreviewChange, ResourceVersion,
     },
+    autonomy::{
+        ApprovalMode, ArchiveCase, ArchiveKind, AutonomyCore, AutonomyError, AutonomySnapshot,
+        Citation as AutonomyCitation, DailyReport, Decision, LearnedRule, ReviewQueueKind,
+        ReviewRecord, ReviewStatus, RuleChangePreview, RuleOperation, RuleStatus, Schedule,
+        SourceKind as AutonomySourceKind,
+    },
     domain::mail::{
         AccountId, AttachmentId, ConnectRequest, ConnectedAccount, CredentialId,
         DeleteDraftRequest, DisconnectRequest, DraftId, DraftRequest, EmailAddress, FolderId,
@@ -25,12 +31,19 @@ use crate::{
         ProviderEndpoint, ProviderKind, RetrieveRequest, SendRequest, SendResult, SyncChange,
         SyncRequest, Validate,
     },
+    local_files::LocalFileService,
     migration::{self, LegacyMigrationState, LegacyMigrationStatus, MigrationError},
     native_credentials::{
         capture_native_credential, NativeCredential, NativeCredentialError, NativeCredentialPrompt,
     },
+    ollama::{OllamaClient, OllamaLimits},
     providers::{gmail_oauth::GmailOAuthOnboarding, ProviderError, ProviderRegistry},
     recovery::{RecoveryRecord as AuthorizedRecovery, RecoveryStore},
+    steward::{
+        AgentAnswer as StewardAnswer, AnswerConfidence, ApplicationRecordRepository,
+        OllamaModelProvider, RecordsSteward, SourceKind as StewardSourceKind, StewardError,
+        ToolRegistry,
+    },
     storage::{
         AccountRecord, AuditRecord, DraftRecord, FolderRecord, MessageBody, MessageRecord,
         PlanRecord, RecoveryRecord as StoredRecovery, Storage, StorageError, SyncCursorRecord,
@@ -152,13 +165,47 @@ impl From<AgentError> for CommandError {
     }
 }
 
+impl From<StewardError> for CommandError {
+    fn from(error: StewardError) -> Self {
+        match error {
+            StewardError::InvalidInput(_) => Self::invalid(),
+            StewardError::RecordNotFound => Self::not_found(),
+            StewardError::RepositoryInvariant
+            | StewardError::RepositoryUnavailable
+            | StewardError::ModelUnavailable
+            | StewardError::ArithmeticOverflow => Self::unavailable(),
+        }
+    }
+}
+
+impl From<AutonomyError> for CommandError {
+    fn from(error: AutonomyError) -> Self {
+        match error {
+            AutonomyError::InvalidInput(_) => Self::invalid(),
+            AutonomyError::NotFound => Self::not_found(),
+            AutonomyError::InvalidState => {
+                Self::new("invalid_state", "This item is not in the required state.")
+            }
+            AutonomyError::NotReversible => {
+                Self::new("not_reversible", "This action cannot be undone.")
+            }
+            AutonomyError::ConfirmationRequired => Self::new(
+                "confirmation_required",
+                "The required confirmation did not match.",
+            ),
+        }
+    }
+}
+
 pub struct AppState {
-    storage: Storage,
+    storage: Arc<Storage>,
     vault: CredentialVault,
     providers: Arc<ProviderRegistry>,
     gmail_onboarding: Option<Arc<GmailOAuthOnboarding>>,
     policy: Mutex<AgentPolicy>,
     recovery: Mutex<RecoveryStore>,
+    autonomy: Mutex<AutonomyCore>,
+    local_files: Arc<LocalFileService>,
     legacy_source: Option<PathBuf>,
 }
 
@@ -195,6 +242,9 @@ impl AppState {
             PermissionLevel::Move,
             PermissionLevel::Delete,
         ];
+        let storage = Arc::new(storage);
+        let local_files = Arc::new(LocalFileService::new(storage.clone()));
+        local_files.start_persisted_watchers()?;
         let mut policy = AgentPolicy::new(permissions, 24 * 60 * 60 * 1_000)?;
         for record in storage.list_plans(None, PLAN_LIMIT)? {
             if let Ok(payload) = serde_json::from_value::<StoredPlanPayload>(record.payload) {
@@ -209,6 +259,14 @@ impl AppState {
                     .map_err(|_| CommandError::unavailable())?;
             }
         }
+        let autonomy = match storage.load_autonomy_state()? {
+            Some(value) => {
+                let snapshot = serde_json::from_value::<AutonomySnapshot>(value)
+                    .map_err(|_| CommandError::unavailable())?;
+                AutonomyCore::restore(snapshot)?
+            }
+            None => AutonomyCore::default(),
+        };
         Ok(Self {
             storage,
             vault,
@@ -216,6 +274,8 @@ impl AppState {
             gmail_onboarding: None,
             policy: Mutex::new(policy),
             recovery: Mutex::new(recovery),
+            autonomy: Mutex::new(autonomy),
+            local_files,
             legacy_source: None,
         })
     }
@@ -230,6 +290,27 @@ impl AppState {
             .map_err(|_| CommandError::unavailable())
     }
 
+    fn autonomy(&self) -> Result<MutexGuard<'_, AutonomyCore>, CommandError> {
+        self.autonomy
+            .lock()
+            .map_err(|_| CommandError::unavailable())
+    }
+
+    fn persist_autonomy(&self, autonomy: &AutonomyCore) -> Result<(), CommandError> {
+        let value =
+            serde_json::to_value(autonomy.snapshot()).map_err(|_| CommandError::unavailable())?;
+        self.storage
+            .save_autonomy_state(&value, now_ms()? as i64)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn scheduler_tick(&self) -> Result<(), CommandError> {
+        let mut autonomy = self.autonomy()?;
+        if autonomy.daily_report(now_ms()?).is_some() {
+            self.persist_autonomy(&autonomy)?;
+        }
+        Ok(())
+    }
     fn account(&self, id: &str) -> Result<AccountRecord, CommandError> {
         validate_id(id)?;
         self.storage
@@ -239,6 +320,10 @@ impl AppState {
 
     fn provider_for(&self, account: &AccountRecord) -> Result<ProviderKind, CommandError> {
         provider_kind(&account.provider)
+    }
+
+    pub(crate) fn local_files(&self) -> Arc<LocalFileService> {
+        self.local_files.clone()
     }
 }
 
@@ -342,6 +427,98 @@ pub struct SearchHitView {
     pub matched_snippet: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AskRecordsRequest {
+    pub query: String,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OllamaDiscoveryView {
+    pub available: bool,
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCitationView {
+    pub source_kind: &'static str,
+    pub record_id: String,
+    pub title: String,
+    pub excerpt: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StewardPlanView {
+    pub id: String,
+    pub summary: String,
+    pub affected_count: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StewardAnswerView {
+    pub answer: String,
+    pub citations: Vec<AgentCitationView>,
+    pub confidence: f32,
+    pub plan: Option<StewardPlanView>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuleInputRequest {
+    pub name: String,
+    pub conditions: Vec<String>,
+    pub actions: Vec<String>,
+    pub reason: String,
+    pub confidence_threshold: f32,
+    pub approval_mode: ApprovalMode,
+    pub schedule: Schedule,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreviewRuleChangeRequest {
+    pub input: RuleInputRequest,
+    pub rule_id: Option<String>,
+    #[serde(default)]
+    pub deleting: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AskAgentRequest {
+    pub question: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReviewQueueRequest {
+    pub queue: Option<ReviewQueueKind>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReviewDecisionRequest {
+    pub id: String,
+    pub decision: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReviewIdRequest {
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConfirmRuleChangeRequest {
+    pub preview: RuleChangePreview,
+    pub confirmation: String,
+}
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ListMessagesRequest {
@@ -1113,6 +1290,252 @@ pub fn search_messages(
     hits.sort_by_key(|(received_at, _)| Reverse(*received_at));
     hits.truncate(request.limit as usize);
     Ok(hits.into_iter().map(|(_, hit)| hit).collect())
+}
+
+#[tauri::command]
+pub async fn discover_ollama_models() -> Result<OllamaDiscoveryView, CommandError> {
+    let client =
+        OllamaClient::local(OllamaLimits::default()).map_err(|_| CommandError::unavailable())?;
+    Ok(match client.discover().await {
+        Ok(models) => OllamaDiscoveryView {
+            available: true,
+            models: models
+                .into_iter()
+                .map(|model| model.name().to_owned())
+                .collect(),
+        },
+        Err(_) => OllamaDiscoveryView {
+            available: false,
+            models: Vec::new(),
+        },
+    })
+}
+
+#[tauri::command]
+pub async fn ask_records(
+    state: State<'_, AppState>,
+    request: AskRecordsRequest,
+) -> Result<StewardAnswer, CommandError> {
+    run_records_query(&state, &request.query, request.model.as_deref()).await
+}
+
+async fn run_records_query(
+    state: &AppState,
+    query: &str,
+    requested_model: Option<&str>,
+) -> Result<StewardAnswer, CommandError> {
+    validate_search(query)?;
+    if requested_model.is_some_and(|model| model.len() > 160 || model.chars().any(char::is_control))
+    {
+        return Err(CommandError::invalid());
+    }
+    let files = state.local_files();
+    let repository = ApplicationRecordRepository::new(state.storage.as_ref(), files.as_ref());
+    let tools = ToolRegistry::new(&repository);
+    let client =
+        OllamaClient::local(OllamaLimits::default()).map_err(|_| CommandError::unavailable())?;
+    let selected = match client.discover().await {
+        Ok(models) => match requested_model {
+            Some(requested) => models.into_iter().find(|model| model.name() == requested),
+            None => models.into_iter().next(),
+        },
+        Err(_) => None,
+    };
+    let steward = match selected {
+        Some(model) => {
+            let provider = Arc::new(OllamaModelProvider::new(client, model));
+            RecordsSteward::new(tools.with_embeddings(provider.clone()))
+                .with_intent_provider(provider)
+        }
+        None => RecordsSteward::new(tools),
+    };
+    steward.ask(query, now_ms()?).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn ask_agent(
+    state: State<'_, AppState>,
+    request: AskAgentRequest,
+) -> Result<StewardAnswerView, CommandError> {
+    let answer = run_records_query(&state, &request.question, None).await?;
+    let citations = answer
+        .citations
+        .iter()
+        .map(|citation| AgentCitationView {
+            source_kind: match citation.source_kind {
+                StewardSourceKind::Email => "email",
+                StewardSourceKind::File => "file",
+            },
+            record_id: citation.record_id.clone(),
+            title: citation.title.clone(),
+            excerpt: citation.excerpt.clone(),
+        })
+        .collect::<Vec<_>>();
+    let plan = answer.action_plan.as_ref().map(|plan| StewardPlanView {
+        id: plan.plan_id.clone(),
+        summary: plan.reason.clone(),
+        affected_count: plan.targets.len().min(u32::MAX as usize) as u32,
+    });
+    if let Some(action_plan) = &answer.action_plan {
+        let affected_records = citations
+            .iter()
+            .map(|citation| AutonomyCitation {
+                source_kind: match citation.source_kind {
+                    "email" => AutonomySourceKind::Email,
+                    _ => AutonomySourceKind::File,
+                },
+                record_id: citation.record_id.clone(),
+                title: citation.title.clone(),
+                excerpt: citation.excerpt.clone(),
+            })
+            .collect::<Vec<_>>();
+        let review = ReviewRecord {
+            id: action_plan.plan_id.clone(),
+            queue: ReviewQueueKind::SuggestedAction,
+            title: "Review proposed archive".into(),
+            reason: action_plan.reason.clone(),
+            status: ReviewStatus::Suggested,
+            confidence: match answer.confidence {
+                AnswerConfidence::High => 0.95,
+                AnswerConfidence::Medium => 0.7,
+                AnswerConfidence::Low => 0.4,
+            },
+            affected_records: affected_records.clone(),
+            reversible: true,
+            created_at_ms: action_plan.created_at_ms,
+        };
+        let archive = ArchiveCase {
+            id: action_plan.plan_id.clone(),
+            kind: ArchiveKind::Employee,
+            title: "Proposed employee archive".into(),
+            summary: action_plan.reason.clone(),
+            citations: affected_records,
+            updated_at_ms: action_plan.created_at_ms,
+        };
+        let mut autonomy = state.autonomy()?;
+        autonomy.add_review(review)?;
+        autonomy.add_archive(archive)?;
+        state.persist_autonomy(&autonomy)?;
+    }
+    Ok(StewardAnswerView {
+        answer: answer.answer,
+        citations,
+        confidence: match answer.confidence {
+            AnswerConfidence::High => 0.95,
+            AnswerConfidence::Medium => 0.7,
+            AnswerConfidence::Low => 0.4,
+        },
+        plan,
+    })
+}
+
+#[tauri::command]
+pub fn list_review_queue(
+    state: State<'_, AppState>,
+    request: ReviewQueueRequest,
+) -> Result<Vec<ReviewRecord>, CommandError> {
+    Ok(state.autonomy()?.reviews(request.queue))
+}
+
+#[tauri::command]
+pub fn decide_review_item(
+    state: State<'_, AppState>,
+    request: ReviewDecisionRequest,
+) -> Result<ReviewRecord, CommandError> {
+    validate_id(&request.id)?;
+    let decision = match request.decision.as_str() {
+        "approve" => Decision::Approve,
+        "reject" => Decision::Reject,
+        _ => return Err(CommandError::invalid()),
+    };
+    let mut autonomy = state.autonomy()?;
+    let item = autonomy.decide(&request.id, decision)?;
+    state.persist_autonomy(&autonomy)?;
+    Ok(item)
+}
+
+#[tauri::command]
+pub fn undo_review_item(
+    state: State<'_, AppState>,
+    request: ReviewIdRequest,
+) -> Result<ReviewRecord, CommandError> {
+    validate_id(&request.id)?;
+    let mut autonomy = state.autonomy()?;
+    let item = autonomy.undo(&request.id)?;
+    state.persist_autonomy(&autonomy)?;
+    Ok(item)
+}
+
+#[tauri::command]
+pub fn list_rules(state: State<'_, AppState>) -> Result<Vec<LearnedRule>, CommandError> {
+    Ok(state.autonomy()?.rules())
+}
+
+#[tauri::command]
+pub fn preview_rule_change(
+    state: State<'_, AppState>,
+    request: PreviewRuleChangeRequest,
+) -> Result<RuleChangePreview, CommandError> {
+    let operation = if request.deleting {
+        RuleOperation::Delete
+    } else if request.rule_id.is_some() {
+        RuleOperation::Update
+    } else {
+        RuleOperation::Create
+    };
+    let id = request.rule_id.unwrap_or_else(|| random_opaque_id("rule"));
+    validate_id(&id)?;
+    let rule = LearnedRule {
+        id,
+        name: request.input.name,
+        conditions: request.input.conditions,
+        actions: request.input.actions,
+        reason: request.input.reason,
+        status: RuleStatus::Active,
+        error_count: 0,
+        confidence_threshold: request.input.confidence_threshold,
+        approval_mode: request.input.approval_mode,
+        schedule: request.input.schedule,
+        updated_at_ms: now_ms()?,
+    };
+    state
+        .autonomy()?
+        .preview_rule_change(rule, operation)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn confirm_rule_change(
+    state: State<'_, AppState>,
+    request: ConfirmRuleChangeRequest,
+) -> Result<LearnedRule, CommandError> {
+    let rule = request.preview.rule.clone();
+    let mut autonomy = state.autonomy()?;
+    autonomy.confirm_rule_change(request.preview, &request.confirmation)?;
+    state.persist_autonomy(&autonomy)?;
+    Ok(rule)
+}
+
+#[tauri::command]
+pub fn list_archives(state: State<'_, AppState>) -> Result<Vec<ArchiveCase>, CommandError> {
+    Ok(state.autonomy()?.archives())
+}
+
+#[tauri::command]
+pub fn get_daily_report(state: State<'_, AppState>) -> Result<DailyReport, CommandError> {
+    let now = now_ms()?;
+    let mut autonomy = state.autonomy()?;
+    let report = autonomy
+        .daily_report(now)
+        .or_else(|| autonomy.latest_daily_report())
+        .unwrap_or(DailyReport {
+            generated_at_ms: now,
+            anomalies: Vec::new(),
+            duplicates: Vec::new(),
+            deadlines: Vec::new(),
+        });
+    state.persist_autonomy(&autonomy)?;
+    Ok(report)
 }
 
 #[tauri::command]

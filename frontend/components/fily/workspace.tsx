@@ -16,6 +16,7 @@ import type {
 } from "@/lib/fily-api"
 import { AccountSettings } from "./account-settings"
 import { AgentPlanApproval } from "./agent-plan-approval"
+import { AgentWorkspace } from "./agent-workspace"
 import { AuditHistory } from "./audit-history"
 import { InboxScreen } from "./inbox-screen"
 import { ComposePanel, type ComposeMode, type ComposeValue } from "./compose-panel"
@@ -520,6 +521,7 @@ export function Workspace({ data }: { data: BootstrapData }) {
           }}
         />
       ) : null}
+      {screen === "agent" ? <AgentWorkspace /> : null}
       {screen === "settings" ? (
         <AccountSettings
           accounts={workspaceData.accounts}

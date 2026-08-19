@@ -1,0 +1,9 @@
+[[permission]]
+identifier = "allow-discover-ollama-models"
+description = "Allows bounded discovery of models from the fixed loopback Ollama service."
+commands.allow = ["discover_ollama_models"]
+
+[[permission]]
+identifier = "allow-ask-records"
+description = "Allows citation-grounded reads and review-only action proposals across encrypted email and approved local files."
+commands.allow = ["ask_records"]

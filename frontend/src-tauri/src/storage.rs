@@ -20,7 +20,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::vault::{CredentialVault, VaultError};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 5;
 const NONCE_LEN: usize = 24;
 const MAX_ID_LEN: usize = 1_024;
 const MAX_REMOTE_FOLDER_ID_LEN: usize = 512;
@@ -1225,6 +1225,13 @@ impl Storage {
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
     }
+    pub(crate) fn with_connection<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        let connection = self.lock()?;
+        operation(&connection)
+    }
 
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, StorageError> {
         self.connection
@@ -1309,6 +1316,35 @@ impl Storage {
             )
             .map_err(|_| StorageError::Authentication)
     }
+    pub fn save_autonomy_state(&self, state: &Value, updated_at: i64) -> Result<(), StorageError> {
+        let (nonce, ciphertext) = self.encrypt("autonomy_state", "current", "payload", state)?;
+        self.lock()?.execute(
+            "INSERT INTO autonomy_state(id,payload_nonce,payload_ciphertext,updated_at)
+             VALUES('current',?1,?2,?3)
+             ON CONFLICT(id) DO UPDATE SET
+               payload_nonce=excluded.payload_nonce,
+               payload_ciphertext=excluded.payload_ciphertext,
+               updated_at=excluded.updated_at",
+            params![nonce, ciphertext, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_autonomy_state(&self) -> Result<Option<Value>, StorageError> {
+        let stored = self
+            .lock()?
+            .query_row(
+                "SELECT payload_nonce,payload_ciphertext FROM autonomy_state WHERE id='current'",
+                [],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        stored
+            .map(|(nonce, ciphertext)| {
+                self.decrypt("autonomy_state", "current", "payload", &nonce, &ciphertext)
+            })
+            .transpose()
+    }
 }
 
 fn initialize_schema(connection: &mut Connection) -> Result<(), StorageError> {
@@ -1325,6 +1361,12 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StorageError> {
         }
         if version < 3 {
             create_mailbox_sync_schema(&transaction, true)?;
+        }
+        if version < 4 {
+            create_local_files_schema(&transaction)?;
+        }
+        if version < 5 {
+            create_autonomy_schema(&transaction)?;
         }
     }
     if version < SCHEMA_VERSION {
@@ -1397,6 +1439,8 @@ fn create_schema(transaction: &Transaction<'_>) -> Result<(), StorageError> {
     )?;
     create_migration_checkpoint_schema(transaction)?;
     create_mailbox_sync_schema(transaction, false)?;
+    create_local_files_schema(transaction)?;
+    create_autonomy_schema(transaction)?;
     Ok(())
 }
 
@@ -1440,6 +1484,93 @@ fn create_mailbox_sync_schema(
             [],
         )?;
     }
+    Ok(())
+}
+
+fn create_local_files_schema(transaction: &Transaction<'_>) -> Result<(), StorageError> {
+    transaction.execute_batch(
+        "CREATE TABLE approved_file_roots (
+           id TEXT PRIMARY KEY,
+           canonical_path TEXT NOT NULL UNIQUE,
+           identity TEXT NOT NULL,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL);
+         CREATE TABLE file_records (
+           id TEXT PRIMARY KEY,
+           root_id TEXT NOT NULL REFERENCES approved_file_roots(id) ON DELETE CASCADE,
+           relative_path TEXT NOT NULL,
+           title TEXT NOT NULL,
+           media_type TEXT NOT NULL,
+           size_bytes INTEGER NOT NULL,
+           modified_at INTEGER NOT NULL,
+           content_hash TEXT NOT NULL,
+           duplicate_group TEXT,
+           version_group TEXT NOT NULL,
+           extraction_status TEXT NOT NULL,
+           content TEXT NOT NULL,
+           excerpt TEXT NOT NULL,
+           indexed_at INTEGER NOT NULL,
+           UNIQUE(root_id,relative_path));
+         CREATE INDEX file_records_hash ON file_records(content_hash);
+         CREATE INDEX file_records_version ON file_records(root_id,version_group);
+         CREATE VIRTUAL TABLE file_search USING fts5(
+           record_id UNINDEXED, title, relative_path, content,
+           tokenize='unicode61 remove_diacritics 2');
+         CREATE TRIGGER file_search_insert AFTER INSERT ON file_records BEGIN
+           INSERT INTO file_search(record_id,title,relative_path,content)
+           VALUES(new.id,new.title,new.relative_path,new.content);
+         END;
+         CREATE TRIGGER file_search_update
+         AFTER UPDATE OF title,relative_path,content ON file_records BEGIN
+           DELETE FROM file_search WHERE record_id=old.id;
+           INSERT INTO file_search(record_id,title,relative_path,content)
+           VALUES(new.id,new.title,new.relative_path,new.content);
+         END;
+         CREATE TRIGGER file_search_delete AFTER DELETE ON file_records BEGIN
+           DELETE FROM file_search WHERE record_id=old.id;
+         END;
+         CREATE TABLE file_action_plans (
+           id TEXT PRIMARY KEY,
+           root_id TEXT NOT NULL REFERENCES approved_file_roots(id) ON DELETE CASCADE,
+           record_id TEXT NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+           action TEXT NOT NULL,
+           source_relative TEXT NOT NULL,
+           destination_relative TEXT NOT NULL,
+           expected_hash TEXT NOT NULL,
+           preview TEXT NOT NULL,
+           confirmation_phrase TEXT NOT NULL,
+           status TEXT NOT NULL,
+           created_at INTEGER NOT NULL,
+           expires_at INTEGER NOT NULL,
+           approved_at INTEGER,
+           executed_at INTEGER);
+         CREATE INDEX file_action_plans_status ON file_action_plans(status,created_at DESC);
+         CREATE TABLE file_action_recovery (
+           id TEXT PRIMARY KEY,
+           plan_id TEXT NOT NULL UNIQUE REFERENCES file_action_plans(id) ON DELETE CASCADE,
+           root_id TEXT NOT NULL REFERENCES approved_file_roots(id) ON DELETE CASCADE,
+           record_id TEXT NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+           action TEXT NOT NULL,
+           before_relative TEXT NOT NULL,
+           after_relative TEXT NOT NULL,
+           expected_hash TEXT NOT NULL,
+           status TEXT NOT NULL,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL);
+         CREATE INDEX file_action_recovery_status
+           ON file_action_recovery(status,created_at DESC);",
+    )?;
+    Ok(())
+}
+
+fn create_autonomy_schema(transaction: &Transaction<'_>) -> Result<(), StorageError> {
+    transaction.execute_batch(
+        "CREATE TABLE autonomy_state (
+           id TEXT PRIMARY KEY CHECK(id='current'),
+           payload_nonce BLOB NOT NULL CHECK(length(payload_nonce)=24),
+           payload_ciphertext BLOB NOT NULL,
+           updated_at INTEGER NOT NULL);",
+    )?;
     Ok(())
 }
 

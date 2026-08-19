@@ -43,6 +43,10 @@ zeroize = { version = "1.8", features = ["derive"] }
 open = "5.3"
 rfd = { version = "0.15", default-features = false, features = ["tokio", "xdg-portal"] }
 tokio = { version = "1", features = ["fs", "io-util", "net", "time"] }
+notify = "6.1"
+walkdir = "2.5"
+pdf-extract = "0.7"
+tempfile = "3.12"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

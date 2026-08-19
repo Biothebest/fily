@@ -14,6 +14,8 @@ import type {
   DraftView,
   FilyApi,
   OpaqueId,
+  FolderGrant,
+  LocalFileRecord,
   PlanExecution,
   SanitizedMessage,
   MessagePage,
@@ -22,6 +24,14 @@ import type {
   SyncProgress,
   SyncResult,
   SendExecution,
+  AgentAnswer,
+  ArchiveCase,
+  DailyReport,
+  LearnedRule,
+  ReviewQueueKind,
+  ReviewRecord,
+  RuleInput,
+  RuleChangePreview,
 } from "./types"
 
 const MAX_ID_LENGTH = 256
@@ -88,6 +98,18 @@ async function command<T>(name: string, request?: Record<string, unknown>): Prom
       if (message) throw new Error(message)
     }
     throw new Error("The Fily core could not complete that request.")
+  }
+}
+
+async function directCommand<T>(name: string, args?: Record<string, unknown>): Promise<T> {
+  try {
+    return args === undefined ? await invoke<T>(name) : await invoke<T>(name, args)
+  } catch (error) {
+    if (error instanceof Error) throw error
+    if (typeof error === "object" && error !== null && "message" in error && typeof error.message === "string") {
+      throw new Error(error.message.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 512))
+    }
+    throw new Error("The Fily core could not complete that local file request.")
   }
 }
 
@@ -234,6 +256,71 @@ class TauriFilyApi implements FilyApi {
   executeSend(planId: OpaqueId): Promise<SendExecution> {
     return command("execute_send", { planId: opaqueId(planId, "Plan") })
   }
+  askAgent(question: string): Promise<AgentAnswer> {
+    return command("ask_agent", { question: boundedText(question, "Question", MAX_QUERY_LENGTH) })
+  }
+
+  listReviewQueue(queue?: ReviewQueueKind): Promise<ReviewRecord[]> {
+    return command("list_review_queue", { queue: queue ?? null })
+  }
+
+  decideReviewItem(id: OpaqueId, decision: "approve" | "reject"): Promise<ReviewRecord> {
+    return command("decide_review_item", { id: opaqueId(id, "Review item"), decision })
+  }
+
+  undoReviewItem(id: OpaqueId): Promise<ReviewRecord> {
+    return command("undo_review_item", { id: opaqueId(id, "Review item") })
+  }
+
+  listRules(): Promise<LearnedRule[]> {
+    return command("list_rules")
+  }
+
+  previewRuleChange(input: RuleInput, ruleId?: OpaqueId, deleting = false): Promise<RuleChangePreview> {
+    return command("preview_rule_change", {
+      input: {
+        ...input,
+        name: boundedText(input.name, "Rule name", MAX_QUERY_LENGTH),
+        reason: boundedText(input.reason, "Rule reason", MAX_QUERY_LENGTH),
+        conditions: input.conditions.slice(0, 20).map((value) => boundedText(value, "Condition", MAX_QUERY_LENGTH)),
+        actions: input.actions.slice(0, 20).map((value) => boundedText(value, "Action", MAX_QUERY_LENGTH)),
+        confidenceThreshold: Math.max(0, Math.min(1, input.confidenceThreshold)),
+      },
+      ruleId: ruleId ? opaqueId(ruleId, "Rule") : undefined,
+      deleting,
+    })
+  }
+
+
+  confirmRuleChange(preview: RuleChangePreview, confirmation: string): Promise<LearnedRule> {
+    return command("confirm_rule_change", {
+      preview,
+      confirmation: boundedText(confirmation, "Rule confirmation", MAX_CONFIRMATION_LENGTH),
+    })
+  }
+  listArchives(): Promise<ArchiveCase[]> {
+    return command("list_archives")
+  }
+
+  getDailyReport(): Promise<DailyReport> {
+    return command("get_daily_report")
+  }
+  pickFolderGrant(): Promise<FolderGrant | null> {
+    return directCommand("pick_folder_grant")
+  }
+
+  listFolderGrants(): Promise<FolderGrant[]> {
+    return directCommand("list_folder_grants")
+  }
+
+  rescanFolderGrant(rootId: OpaqueId): Promise<LocalFileRecord[]> {
+    return directCommand("rescan_folder_grant", { rootId: opaqueId(rootId, "Folder") })
+  }
+
+  revokeFolderGrant(rootId: OpaqueId): Promise<boolean> {
+    return directCommand("revoke_folder_grant", { rootId: opaqueId(rootId, "Folder") })
+  }
+
 }
 
 export const filyApi: FilyApi = new TauriFilyApi()

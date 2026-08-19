@@ -1,0 +1,54 @@
+[[permission]]
+identifier = "allow-pick-folder-grant"
+description = "Allows the native folder picker and explicit local folder approval."
+commands.allow = ["pick_folder_grant"]
+
+[[permission]]
+identifier = "allow-list-folder-grants"
+description = "Allows listing approved local folder grants."
+commands.allow = ["list_folder_grants"]
+
+[[permission]]
+identifier = "allow-revoke-folder-grant"
+description = "Allows revoking an approved local folder grant."
+commands.allow = ["revoke_folder_grant"]
+
+[[permission]]
+identifier = "allow-rescan-folder-grant"
+description = "Allows rescanning one approved local folder."
+commands.allow = ["rescan_folder_grant"]
+
+[[permission]]
+identifier = "allow-get-file-record"
+description = "Allows reading indexed metadata for one local file record."
+commands.allow = ["get_file_record"]
+
+[[permission]]
+identifier = "allow-search-files"
+description = "Allows bounded full-text search over indexed local file records."
+commands.allow = ["search_files"]
+
+[[permission]]
+identifier = "allow-list-file-relations"
+description = "Allows listing duplicate and version relations for a local file record."
+commands.allow = ["list_file_relations"]
+
+[[permission]]
+identifier = "allow-create-file-action-plan"
+description = "Allows creating an immutable preview for a scoped local file action."
+commands.allow = ["create_file_action_plan"]
+
+[[permission]]
+identifier = "allow-approve-file-action-plan"
+description = "Allows explicitly approving a pending local file action plan."
+commands.allow = ["approve_file_action_plan"]
+
+[[permission]]
+identifier = "allow-execute-file-action-plan"
+description = "Allows executing an approved, version-checked local file action plan."
+commands.allow = ["execute_file_action_plan"]
+
+[[permission]]
+identifier = "allow-undo-file-action"
+description = "Allows undoing a recoverable local file action when its version still matches."
+commands.allow = ["undo_file_action"]
